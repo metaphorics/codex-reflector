@@ -87,9 +87,9 @@ def parse_verdict(raw: str) -> str:
 def classify(tool_name: str, hook_event: str) -> str:
     if hook_event == "PostToolUseFailure":
         return "bash_failure"
-    if tool_name in ("Write", "Edit") or "morph-mcp__edit_file" in tool_name:
+    if tool_name in ("Write", "Edit", "MultiEdit", "Patch") or any(x in tool_name for x in ("edit_file", "write_file", "create_file", "patch_file", "morph-mcp")):
         return "code_change"
-    if any(x in tool_name for x in ("sequentialthinking", "actor-critic", "shannon")):
+    if any(x in tool_name for x in ("sequentialthinking", "sequential_thinking", "thinking", "actor-critic", "shannon")):
         return "thinking"
     return "code_change"  # conservative default
 
