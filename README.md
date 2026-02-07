@@ -9,6 +9,10 @@ Claude Code acts. Codex reviews. Every code change gets a second opinion. Every 
 - [Codex CLI](https://github.com/openai/codex) on PATH (`codex exec` must work)
 - Python 3.8+ (stdlib only, no pip dependencies)
 
+## Install
+claude plugin marketplace add metaphorics/odin-reflector
+claude plugin install codex-reflector@odin-reflector
+
 ## Hook Events
 
 | Event | Trigger | Mode | Purpose |
