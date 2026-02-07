@@ -1,5 +1,5 @@
 {
-  "description": "Codex reflector: code review (async), thinking metacognition (sync), bash failure diagnostics (async), stop-gate, and pre-compact summary",
+  "description": "Codex reflector: code review (async), plan review (sync), thinking metacognition (sync), bash failure diagnostics (async), subagent review (sync), stop review (sync), and pre-compact summary",
   "hooks": {
     "PostToolUse": [
       {
@@ -7,9 +7,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\" --effort medium",
             "timeout": 120,
             "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\" --effort high",
+            "timeout": 120
           }
         ]
       },
@@ -18,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\" --effort low",
             "timeout": 120
           }
         ]
@@ -30,9 +40,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\" --effort low",
             "timeout": 120,
             "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\" --effort high",
+            "timeout": 120
           }
         ]
       }
@@ -42,8 +63,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
-            "timeout": 10
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\" --effort high",
+            "timeout": 120
           }
         ]
       }
@@ -53,7 +74,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\" --effort medium",
             "timeout": 120
           }
         ]
