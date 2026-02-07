@@ -28,11 +28,20 @@ from typing import Callable
 # ---------------------------------------------------------------------------
 
 DEBUG = os.environ.get("CODEX_REFLECTOR_DEBUG", "0") == "1"
-MAX_CONTENT = 40_000  # chars sent to codex per prompt
-MAX_OUTPUT = 2000  # chars returned from codex in responses
+MAX_CONTENT = 200_000  # chars sent to codex per prompt (~100K tokens)
+MAX_OUTPUT = 8000  # chars returned from codex in responses
 STATE_DIR = Path("/tmp")
 DEFAULT_MODEL = "gpt-5.3-codex"
 FAST_MODEL = "gpt-5.1-codex-mini"
+
+# Compact output directives — verdict vs non-verdict prompts.
+_COMPACT_VERDICT = """
+
+OUTPUT CONSTRAINTS: ≤150 words. First line is PASS or FAIL only. Then bullet points, one per issue, max 5."""
+
+_COMPACT_ANALYSIS = """
+
+OUTPUT CONSTRAINTS: ≤150 words. No preamble, no hedging. Bullet points only, max 5."""
 
 
 def debug(msg: str) -> None:
@@ -310,9 +319,6 @@ def _gate_model_effort(
     if category != "code_change":
         return model, effort
 
-    file_path = str(tool_input.get("file_path", tool_input.get("path", "")) or "")
-    p = file_path.lower()
-
     # Large content → force DEFAULT_MODEL
     content = tool_input.get("content", "")
     old = tool_input.get("old_string", "")
@@ -499,7 +505,7 @@ Your first line MUST be exactly PASS or FAIL.
 FAIL if: any non-trivial correctness or security issue found.
 PASS only if: no meaningful issues found after thorough review.
 
-Then explain your findings concisely."""
+Then explain your findings concisely.""" + _COMPACT_VERDICT
 
 
 def build_thinking_prompt(tool_name: str, tool_input: dict) -> str:
@@ -548,7 +554,7 @@ Evaluate:
 - Invalidating conditions: name one concrete scenario where this reasoning collapses
 - Overlooked alternatives: a fundamentally different approach not considered
 
-Be direct and concise. Do NOT output PASS or FAIL."""
+Be direct and concise. Do NOT output PASS or FAIL.""" + _COMPACT_ANALYSIS
 
 
 def build_bash_failure_prompt(tool_input: dict, error: str) -> str:
@@ -594,7 +600,7 @@ Analyze:
 4. ALTERNATIVE APPROACHES: How to avoid the failure entirely
 5. PREVENTION: Workflow changes to prevent recurrence
 
-Be concise and actionable."""
+Be concise and actionable.""" + _COMPACT_ANALYSIS
 
 
 def build_plan_review_prompt(plan_content: str, plan_path: str) -> str:
@@ -618,7 +624,7 @@ Your first line MUST be exactly PASS or FAIL.
 FAIL if: critical gaps, feasibility issues, or significant technical errors found.
 PASS only if: plan is comprehensive, feasible, and technically sound.
 
-Then explain your findings concisely."""
+Then explain your findings concisely.""" + _COMPACT_VERDICT
 
 
 def build_subagent_review_prompt(agent_type: str, transcript_tail: str) -> str:
@@ -641,7 +647,7 @@ Your first line MUST be exactly PASS or FAIL.
 FAIL if: task incomplete, quality poor, significant requirements missed, or factual errors.
 PASS only if: task fully completed with accurate, high-quality output.
 
-Then explain your findings concisely."""
+Then explain your findings concisely.""" + _COMPACT_VERDICT
 
 
 def build_stop_review_prompt(
@@ -689,7 +695,7 @@ Your first line MUST be exactly PASS or FAIL.
 FAIL if: work incomplete, has regressions, needs critical fixes, or significant quality issues.
 PASS only if: all requested work is complete and codebase is in a clean state.
 
-Then provide concise, actionable commentary."""
+Then provide concise, actionable commentary.""" + _COMPACT_VERDICT
 
 
 def build_precompact_prompt(transcript_tail: str) -> str:
@@ -708,7 +714,7 @@ Summarize the critical context that MUST survive compaction:
 - Constraints or requirements discovered
 - Any pending FAIL reviews or action items
 
-Be concise but comprehensive. This summary will be the only context preserved."""
+Be concise but comprehensive. This summary will be the only context preserved.""" + _COMPACT_ANALYSIS
 
 
 # ---------------------------------------------------------------------------
