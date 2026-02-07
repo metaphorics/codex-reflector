@@ -265,7 +265,7 @@ _MCP_THINKING_MARKERS: tuple[str, ...] = (
 _CATEGORY_DEFAULTS: dict[str, tuple[str, str]] = {
     "code_change": (DEFAULT_MODEL, "medium"),
     "plan_review": (DEFAULT_MODEL, "high"),
-    "thinking": (FAST_MODEL, "high"),
+    "thinking": (DEFAULT_MODEL, "medium"),
     "bash_failure": (FAST_MODEL, "high"),
 }
 
@@ -1049,6 +1049,7 @@ def main() -> None:
         routed = classify(tool_name, event)
         if routed is None:
             sys.exit(0)
+            return
         category, model, effort = routed
         tool_input = hook_data.get("tool_input", {})
 
@@ -1066,6 +1067,7 @@ def main() -> None:
             plan = _find_latest_plan(cwd)
             if plan is None:
                 sys.exit(0)
+                return
             plan_path, plan_content = plan
             prompt = build_plan_review_prompt(plan_content, plan_path)
             raw = invoke_codex(prompt, cwd, effort, model)
