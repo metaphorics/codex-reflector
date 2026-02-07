@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Callable
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -30,31 +31,13 @@ DEBUG = os.environ.get("CODEX_REFLECTOR_DEBUG", "0") == "1"
 MAX_CONTENT = 40_000  # chars sent to codex per prompt
 MAX_OUTPUT = 2000  # chars returned from codex in responses
 STATE_DIR = Path("/tmp")
-VALID_EFFORTS = {"low", "medium", "high", "xhigh"}
+DEFAULT_MODEL = "gpt-5.3-codex"
+FAST_MODEL = "gpt-5.1-codex-mini"
 
 
 def debug(msg: str) -> None:
     if DEBUG:
         print(f"[codex-reflector] {msg}", file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
-# Effort arg parsing
-# ---------------------------------------------------------------------------
-
-
-def parse_effort() -> str:
-    """Parse --effort from sys.argv. Returns validated effort or 'medium'."""
-    for i, arg in enumerate(sys.argv[1:], 1):
-        if arg == "--effort" and i + 1 < len(sys.argv):
-            val = sys.argv[i + 1]
-            if val in VALID_EFFORTS:
-                return val
-        elif arg.startswith("--effort="):
-            val = arg.split("=", 1)[1]
-            if val in VALID_EFFORTS:
-                return val
-    return "medium"
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +73,8 @@ def _sandbox_content(label: str, content: str) -> str:
 
 def _read_tail(path: str, max_bytes: int = 20_000) -> str:
     """Read last max_bytes of a file without loading the whole thing."""
+    if not path:
+        return ""
     try:
         size = os.path.getsize(path)
         with open(path, "r", errors="replace") as f:
@@ -229,32 +214,125 @@ def _change_size_heuristics(content: str, old: str, new: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Tool classification
+# Tool classification — routing tables + model selection
+# ---------------------------------------------------------------------------
+
+# Exact-match routing: tool_name → category
+_TOOL_ROUTES: dict[str, str] = {
+    "Write": "code_change",
+    "Edit": "code_change",
+    "MultiEdit": "code_change",
+    "Patch": "code_change",
+    "NotebookEdit": "code_change",
+    "ExitPlanMode": "plan_review",
+}
+
+# Tools that never need review — fast exit
+_SKIP_TOOLS: frozenset[str] = frozenset(
+    {
+        "Read",
+        "Glob",
+        "Grep",
+        "Bash",
+        "Task",
+        "TaskCreate",
+        "TaskGet",
+        "TaskList",
+        "TaskUpdate",
+        "TaskOutput",
+        "TaskStop",
+        "WebFetch",
+        "WebSearch",
+        "AskUserQuestion",
+        "Skill",
+        "EnterPlanMode",
+    }
+)
+
+# MCP substrings for code-editing tools
+_MCP_EDIT_MARKERS: tuple[str, ...] = ("morph-mcp", "mcp__morph")
+
+# MCP substrings for thinking/metacognition tools
+_MCP_THINKING_MARKERS: tuple[str, ...] = (
+    "sequentialthinking",
+    "sequential_thinking",
+    "actor-critic",
+    "shannon-thinking",
+    "shannonthinking",
+)
+
+# Category → (default_model, default_effort)
+_CATEGORY_DEFAULTS: dict[str, tuple[str, str]] = {
+    "code_change": (DEFAULT_MODEL, "medium"),
+    "plan_review": (DEFAULT_MODEL, "high"),
+    "thinking": (FAST_MODEL, "high"),
+    "bash_failure": (FAST_MODEL, "high"),
+}
+
+
+def classify(tool_name: str, hook_event: str) -> tuple[str, str, str] | None:
+    """Route tool call → (category, model, effort) or None to skip."""
+    if hook_event == "PostToolUseFailure":
+        if tool_name == "Bash":
+            model, effort = _CATEGORY_DEFAULTS["bash_failure"]
+            return ("bash_failure", model, effort)
+        return None
+
+    # Exact match → category
+    cat = _TOOL_ROUTES.get(tool_name)
+    if cat is None and tool_name in _SKIP_TOOLS:
+        return None
+    if cat is None and tool_name.startswith("mcp__"):
+        if any(m in tool_name for m in _MCP_EDIT_MARKERS):
+            cat = "code_change"
+        elif any(m in tool_name for m in _MCP_THINKING_MARKERS):
+            cat = "thinking"
+        else:
+            debug(f"unknown MCP tool skipped: {tool_name}")
+            return None
+    if cat is None:
+        debug(f"unknown tool skipped: {tool_name}")
+        return None
+
+    model, effort = _CATEGORY_DEFAULTS[cat]
+    return (cat, model, effort)
+
+
+# ---------------------------------------------------------------------------
+# Heuristic gating — model/effort upgrades
 # ---------------------------------------------------------------------------
 
 
-def classify(tool_name: str, hook_event: str) -> str:
-    if hook_event == "PostToolUseFailure":
-        return "bash_failure"
-    if tool_name == "ExitPlanMode":
-        return "plan_review"
-    if tool_name in ("Write", "Edit", "MultiEdit", "Patch") or any(
-        x in tool_name
-        for x in ("edit_file", "write_file", "create_file", "patch_file", "morph-mcp")
-    ):
-        return "code_change"
+def _gate_model_effort(
+    category: str, model: str, effort: str, tool_input: dict
+) -> tuple[str, str]:
+    """Upgrade model/effort based on file heuristics."""
+    if category != "code_change":
+        return model, effort
+
+    file_path = str(tool_input.get("file_path", tool_input.get("path", "")) or "")
+    p = file_path.lower()
+
+    # Security-sensitive files → force DEFAULT_MODEL + high effort
     if any(
-        x in tool_name
-        for x in (
-            "sequentialthinking",
-            "sequential_thinking",
-            "thinking",
-            "actor-critic",
-            "shannon",
-        )
+        x in p
+        for x in (".env", "secret", "credential", "key", "auth", "token", "password")
     ):
-        return "thinking"
-    return "code_change"  # conservative default
+        return DEFAULT_MODEL, "high"
+
+    # Large content → force DEFAULT_MODEL
+    content = tool_input.get("content", "")
+    old = tool_input.get("old_string", "")
+    new = tool_input.get("new_string", "")
+    size = len(content or new or "")
+    if size > 5000:
+        return DEFAULT_MODEL, "high"
+
+    # Tiny change → downgrade to FAST_MODEL
+    if old and new and len(new) < 200 and len(old) < 200:
+        return FAST_MODEL, "high"
+
+    return model, effort
 
 
 # ---------------------------------------------------------------------------
@@ -326,12 +404,17 @@ def _find_latest_plan(cwd: str) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------
 
 
-def invoke_codex(prompt: str, cwd: str, effort: str = "medium") -> str:
+def invoke_codex(prompt: str, cwd: str, effort: str = "medium", model: str = "") -> str:
     """Call `codex exec` in read-only sandbox. Returns raw output or ''."""
+    # Env var override takes precedence, then passed model, then DEFAULT_MODEL
+    model = os.environ.get("CODEX_REFLECTOR_MODEL", model or DEFAULT_MODEL)
+    # Fast model always uses high effort
+    if model == FAST_MODEL:
+        effort = "high"
+
     fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex-ref-")
     os.close(fd)
     try:
-        model = os.environ.get("CODEX_REFLECTOR_MODEL", "")
         cmd = [
             "codex",
             "exec",
@@ -341,14 +424,14 @@ def invoke_codex(prompt: str, cwd: str, effort: str = "medium") -> str:
             "--full-auto",
             "-c",
             f"model_reasoning_effort={effort}",
+            "-m",
+            model,
             "-o",
             out_path,
+            "-",  # read prompt from stdin
         ]
-        if model:
-            cmd += ["-m", model]
-        cmd.append("-")  # read prompt from stdin
 
-        debug(f"invoking: {' '.join(cmd)} (effort={effort})")
+        debug(f"invoking: {' '.join(cmd)} (effort={effort}, model={model})")
         subprocess.run(
             cmd,
             input=prompt,
@@ -375,9 +458,7 @@ def invoke_codex(prompt: str, cwd: str, effort: str = "medium") -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_code_review_prompt(
-    tool_name: str, tool_input: dict, tool_response: dict | None
-) -> str:
+def build_code_review_prompt(tool_name: str, tool_input: dict) -> str:
     file_path = tool_input.get("file_path", tool_input.get("path", "unknown"))
     content = tool_input.get("content", "")
     old = tool_input.get("old_string", "")
@@ -638,7 +719,7 @@ Be concise but comprehensive. This summary will be the only context preserved.""
 
 
 # ---------------------------------------------------------------------------
-# FAIL state management (file-locked)
+# FAIL state management (file-locked, atomic)
 # ---------------------------------------------------------------------------
 
 
@@ -647,7 +728,41 @@ def _state_path(session_id: str) -> Path:
     return STATE_DIR / f"codex-reflector-fails-{safe}.json"
 
 
+def _atomic_update_state(
+    session_id: str,
+    updater: Callable[[list[dict]], list[dict] | None],
+) -> list[dict]:
+    """Atomically read-modify-write state under exclusive lock.
+    updater receives current entries, returns new entries or None (no change).
+    """
+    if not session_id:
+        return []
+    path = _state_path(session_id)
+    if not path.exists():
+        path.touch(mode=0o600)
+    with open(path, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            try:
+                entries = json.load(f)
+            except (json.JSONDecodeError, ValueError):
+                entries = []
+            new_entries = updater(entries)
+            if new_entries is not None:
+                f.seek(0)
+                f.truncate()
+                json.dump(new_entries, f)
+                return new_entries
+            return entries
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def _read_state(session_id: str) -> list[dict]:
+    """Read state (read-only, shared lock)."""
+    if not session_id:
+        return []
     path = _state_path(session_id)
     if not path.exists():
         return []
@@ -662,37 +777,29 @@ def _read_state(session_id: str) -> list[dict]:
         return []
 
 
-def _write_state(session_id: str, entries: list[dict]) -> None:
-    path = _state_path(session_id)
-    with open(path, "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            json.dump(entries, f)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-
 def write_fail_state(
     session_id: str, tool_name: str, file_path: str, feedback: str
 ) -> None:
-    entries = _read_state(session_id)
-    # Replace existing entry for same file, or append
-    entries = [e for e in entries if e.get("file_path") != file_path]
-    entries.append(
-        {
-            "tool_name": tool_name,
-            "file_path": file_path,
-            "feedback": feedback[:1500],
-        }
-    )
-    _write_state(session_id, entries)
+    def updater(entries: list[dict]) -> list[dict]:
+        filtered = [e for e in entries if e.get("file_path") != file_path]
+        filtered.append(
+            {
+                "tool_name": tool_name,
+                "file_path": file_path,
+                "feedback": feedback[:1500],
+            }
+        )
+        return filtered
+
+    _atomic_update_state(session_id, updater)
 
 
 def clear_fail_state(session_id: str, file_path: str) -> None:
-    entries = _read_state(session_id)
-    filtered = [e for e in entries if e.get("file_path") != file_path]
-    if len(filtered) != len(entries):
-        _write_state(session_id, filtered)
+    def updater(entries: list[dict]) -> list[dict] | None:
+        filtered = [e for e in entries if e.get("file_path") != file_path]
+        return filtered if len(filtered) != len(entries) else None
+
+    _atomic_update_state(session_id, updater)
 
 
 def format_fails(entries: list[dict]) -> str:
@@ -781,7 +888,7 @@ def respond_subagent_review(raw_output: str) -> dict | None:
     return None  # UNCERTAIN: allow silently
 
 
-def respond_stop(hook_data: dict, cwd: str, effort: str) -> dict | None:
+def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | None:
     # 1. Loop prevention
     if hook_data.get("stop_hook_active"):
         debug("stop_hook_active=true, approving stop")
@@ -798,9 +905,7 @@ def respond_stop(hook_data: dict, cwd: str, effort: str) -> dict | None:
 
     # 3. Active review: gather context
     transcript_path = hook_data.get("transcript_path", "")
-    transcript_tail = ""
-    if transcript_path:
-        transcript_tail = _read_tail(transcript_path)
+    transcript_tail = _read_tail(transcript_path)
 
     stat, diff = _get_git_diff(cwd)
 
@@ -813,7 +918,7 @@ def respond_stop(hook_data: dict, cwd: str, effort: str) -> dict | None:
     if stat or diff:
         git_context = f"--- git diff --stat ---\n{stat}\n\n--- git diff ---\n{diff}"
     prompt = build_stop_review_prompt(transcript_tail, git_context, stat, diff)
-    raw_output = invoke_codex(prompt, cwd, effort)
+    raw_output = invoke_codex(prompt, cwd, effort, model)
 
     if not raw_output:
         debug("codex returned empty, approving stop (fail-open)")
@@ -833,7 +938,9 @@ def respond_stop(hook_data: dict, cwd: str, effort: str) -> dict | None:
         return None
 
 
-def respond_precompact(hook_data: dict, cwd: str, effort: str) -> dict | None:
+def respond_precompact(
+    hook_data: dict, cwd: str, effort: str, model: str
+) -> dict | None:
     transcript_path = hook_data.get("transcript_path", "")
     if not transcript_path:
         debug("no transcript_path, skipping precompact")
@@ -845,7 +952,7 @@ def respond_precompact(hook_data: dict, cwd: str, effort: str) -> dict | None:
         return None
 
     prompt = build_precompact_prompt(transcript_tail)
-    raw_output = invoke_codex(prompt, cwd, effort)
+    raw_output = invoke_codex(prompt, cwd, effort, model)
     if not raw_output:
         return None
 
@@ -903,19 +1010,12 @@ def main() -> None:
 
     # Kill switch
     if os.environ.get("CODEX_REFLECTOR_ENABLED", "1") == "0":
-        debug("disabled via CODEX_REFLECTOR_ENABLED=0")
         sys.exit(0)
-
-    # Parse effort before stdin read (stdin is consumed once)
-    effort = parse_effort()
-    debug(f"effort={effort}")
 
     # Read hook JSON from stdin
     try:
-        raw_input = sys.stdin.read()
-        hook_data = json.loads(raw_input)
-    except (json.JSONDecodeError, OSError) as exc:
-        debug(f"invalid stdin: {exc}")
+        hook_data = json.loads(sys.stdin.read())
+    except (json.JSONDecodeError, OSError):
         sys.exit(0)  # fail-open
 
     event = hook_data.get("hook_event_name", "")
@@ -928,69 +1028,56 @@ def main() -> None:
     result: dict | None = None
 
     if event == "Stop":
-        result = respond_stop(hook_data, cwd, effort)
+        result = respond_stop(hook_data, cwd, "high", DEFAULT_MODEL)
 
     elif event == "SubagentStop":
         if hook_data.get("stop_hook_active"):
-            debug("stop_hook_active=true, approving subagent stop")
             sys.exit(0)
-
         agent_type = hook_data.get("agent_type", "unknown")
-        agent_transcript_path = hook_data.get("agent_transcript_path", "")
-
-        transcript_tail = ""
-        if agent_transcript_path:
-            transcript_tail = _read_tail(agent_transcript_path)
-
+        transcript_tail = _read_tail(hook_data.get("agent_transcript_path", ""))
         if not transcript_tail:
-            debug("no subagent transcript, approving stop")
             sys.exit(0)
-
         prompt = build_subagent_review_prompt(agent_type, transcript_tail)
-        raw_output = invoke_codex(prompt, cwd, effort)
-        result = respond_subagent_review(raw_output)
+        raw = invoke_codex(prompt, cwd, "high", DEFAULT_MODEL)
+        result = respond_subagent_review(raw)
 
     elif event == "PreCompact":
-        result = respond_precompact(hook_data, cwd, effort)
+        result = respond_precompact(hook_data, cwd, "high", FAST_MODEL)
 
     elif event in ("PostToolUse", "PostToolUseFailure"):
         tool_name = hook_data.get("tool_name", "")
+        routed = classify(tool_name, event)
+        if routed is None:
+            sys.exit(0)
+        category, model, effort = routed
         tool_input = hook_data.get("tool_input", {})
-        tool_response = hook_data.get("tool_response", {})
+
+        # Heuristic gating — upgrade/downgrade model+effort
+        model, effort = _gate_model_effort(category, model, effort, tool_input)
+        debug(f"category={category} model={model} effort={effort}")
+
         error = hook_data.get("error", "")
-        category = classify(tool_name, event)
 
-        debug(f"category={category}")
-
-        # Build prompt
         if category == "code_change":
-            prompt = build_code_review_prompt(tool_name, tool_input, tool_response)
+            prompt = build_code_review_prompt(tool_name, tool_input)
+            raw = invoke_codex(prompt, cwd, effort, model)
+            result = respond_code_review(session_id, tool_name, tool_input, raw)
         elif category == "plan_review":
-            plan_result = _find_latest_plan(cwd)
-            if plan_result is None:
-                debug("no plan found, skipping plan review")
+            plan = _find_latest_plan(cwd)
+            if plan is None:
                 sys.exit(0)
-            plan_path, plan_content = plan_result
+            plan_path, plan_content = plan
             prompt = build_plan_review_prompt(plan_content, plan_path)
+            raw = invoke_codex(prompt, cwd, effort, model)
+            result = respond_plan_review(session_id, plan_path, raw)
         elif category == "thinking":
             prompt = build_thinking_prompt(tool_name, tool_input)
+            raw = invoke_codex(prompt, cwd, effort, model)
+            result = respond_thinking(raw)
         elif category == "bash_failure":
             prompt = build_bash_failure_prompt(tool_input, error)
-        else:
-            sys.exit(0)
-
-        # Invoke codex
-        raw_output = invoke_codex(prompt, cwd, effort)
-
-        # Build response
-        if category == "code_change":
-            result = respond_code_review(session_id, tool_name, tool_input, raw_output)
-        elif category == "plan_review":
-            result = respond_plan_review(session_id, plan_path, raw_output)
-        elif category == "thinking":
-            result = respond_thinking(raw_output)
-        elif category == "bash_failure":
-            result = respond_bash_failure(raw_output)
+            raw = invoke_codex(prompt, cwd, effort, model)
+            result = respond_bash_failure(raw)
 
     else:
         debug(f"unhandled event: {event}")
