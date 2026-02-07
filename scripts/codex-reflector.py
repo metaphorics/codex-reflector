@@ -313,20 +313,13 @@ def _gate_model_effort(
     file_path = str(tool_input.get("file_path", tool_input.get("path", "")) or "")
     p = file_path.lower()
 
-    # Security-sensitive files → force DEFAULT_MODEL + high effort
-    if any(
-        x in p
-        for x in (".env", "secret", "credential", "key", "auth", "token", "password")
-    ):
-        return DEFAULT_MODEL, "high"
-
     # Large content → force DEFAULT_MODEL
     content = tool_input.get("content", "")
     old = tool_input.get("old_string", "")
     new = tool_input.get("new_string", "")
     size = len(content or new or "")
     if size > 5000:
-        return DEFAULT_MODEL, "high"
+        return DEFAULT_MODEL, "medium"
 
     # Tiny change → downgrade to FAST_MODEL
     if old and new and len(new) < 200 and len(old) < 200:
@@ -1040,7 +1033,7 @@ def main() -> None:
         result = respond_subagent_review(raw)
 
     elif event == "PreCompact":
-        result = respond_precompact(hook_data, cwd, "high", FAST_MODEL)
+        result = respond_precompact(hook_data, cwd, "high", DEFAULT_MODEL)
 
     elif event in ("PostToolUse", "PostToolUseFailure"):
         tool_name = hook_data.get("tool_name", "")
