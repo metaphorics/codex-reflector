@@ -377,19 +377,128 @@ def _get_git_diff(cwd: str) -> tuple[str, str]:
 # Plan discovery
 # ---------------------------------------------------------------------------
 
+# Global plans directory — plans live in ~/.claude/plans/, NOT <project>/.claude/plans/
+_PLANS_DIR = Path.home() / ".claude" / "plans"
 
-def _find_latest_plan(cwd: str) -> tuple[str, str] | None:
-    """Find the most recently modified plan in project-local .claude/plans/."""
-    plans_dir = Path(cwd) / ".claude" / "plans"
-    if not plans_dir.is_dir():
-        debug("no .claude/plans/ directory")
+# Fallback regex for extracting plan path from tool_response string
+_PLAN_SAVED_RE = re.compile(r"saved to:\s*(/[^\n\"]+\.md)")
+
+
+def _validate_plan_path(path_str: str) -> str | None:
+    """Validate that a plan path is confined to ~/.claude/plans/ and is .md."""
+    try:
+        resolved = Path(path_str).resolve()
+        plans_resolved = _PLANS_DIR.resolve()
+    except (OSError, ValueError):
         return None
-    candidates = list(plans_dir.glob("*.md"))
+    if resolved.suffix != ".md":
+        debug(f"plan path not .md: {resolved}")
+        return None
+    if not str(resolved).startswith(str(plans_resolved) + os.sep):
+        debug(f"plan path outside ~/.claude/plans/: {resolved}")
+        return None
+    return str(resolved)
+
+
+def _extract_plan_path(tool_response: object) -> str | None:
+    """Extract plan file path from ExitPlanMode tool_response.
+
+    Handles dict (with filePath key) and string (with "saved to:" text).
+    Returns a validated absolute path confined to ~/.claude/plans/, or None.
+    """
+    if not tool_response:
+        return None
+
+    # Dict with filePath key (expected common case)
+    if isinstance(tool_response, dict):
+        fp = tool_response.get("filePath")
+        if isinstance(fp, str) and fp:
+            validated = _validate_plan_path(fp)
+            if validated:
+                debug(f"plan path from tool_response.filePath: {validated}")
+                return validated
+        # Dict without filePath — try string content values
+        for key in ("content", "result", "text"):
+            val = tool_response.get(key)
+            if isinstance(val, str):
+                m = _PLAN_SAVED_RE.search(val)
+                if m:
+                    validated = _validate_plan_path(m.group(1).strip())
+                    if validated:
+                        debug(f"plan path from tool_response.{key}: {validated}")
+                        return validated
+        return None
+
+    # String tool_response (fallback)
+    if isinstance(tool_response, str):
+        m = _PLAN_SAVED_RE.search(tool_response)
+        if m:
+            validated = _validate_plan_path(m.group(1).strip())
+            if validated:
+                debug(f"plan path from tool_response string: {validated}")
+                return validated
+
+    return None
+
+
+def _find_plan_for_session(hook_data: dict) -> tuple[str, str] | None:
+    """Deterministic plan discovery from PostToolUse hook data.
+
+    Resolution order:
+      1. tool_response.filePath → direct path (zero I/O best case)
+      2. Content from tool_response.plan or tool_input.plan
+      3. If path found but no content → read from disk
+      4. If content found but no path → synthetic session-keyed path
+      5. Last resort → global ~/.claude/plans/ mtime scan
+    """
+    tool_response = hook_data.get("tool_response")
+    tool_input = hook_data.get("tool_input", {})
+
+    # Extract path from tool_response
+    plan_path = _extract_plan_path(tool_response)
+
+    # Gather content from hook data (avoid disk I/O)
+    plan_content = ""
+    if isinstance(tool_response, dict):
+        plan_content = tool_response.get("plan", "")
+    if not plan_content and isinstance(tool_input, dict):
+        plan_content = tool_input.get("plan", "")
+
+    if plan_path:
+        if plan_content:
+            debug("plan from tool_response path + hook content (zero I/O)")
+            return (plan_path, plan_content[:MAX_CONTENT])
+        # Path found but no content in hook data — read from disk
+        try:
+            content = Path(plan_path).read_text(errors="replace")
+            debug("plan from tool_response path + disk read")
+            return (plan_path, content[:MAX_CONTENT])
+        except OSError as exc:
+            debug(f"cannot read plan at {plan_path}: {exc}")
+
+    if plan_content:
+        # Content but no path — use synthetic session-keyed path
+        session_id = hook_data.get("session_id", "unknown")
+        synthetic = f"<plan:session:{session_id}>"
+        debug(f"plan from hook content with synthetic path: {synthetic}")
+        return (synthetic, plan_content[:MAX_CONTENT])
+
+    # Last resort: global mtime fallback
+    debug("falling back to global mtime plan discovery")
+    return _find_latest_plan_global()
+
+
+def _find_latest_plan_global() -> tuple[str, str] | None:
+    """Find the most recently modified plan in ~/.claude/plans/ (mtime fallback)."""
+    if not _PLANS_DIR.is_dir():
+        debug("no ~/.claude/plans/ directory")
+        return None
+    candidates = list(_PLANS_DIR.glob("*.md"))
     if not candidates:
-        debug("no plan files found")
+        debug("no plan files found in ~/.claude/plans/")
         return None
     latest = max(candidates, key=lambda p: p.stat().st_mtime)
-    debug(f"found plan: {latest}")
+    debug(f"found plan (global mtime): {latest}")
     try:
         content = latest.read_text(errors="replace")
         return (str(latest), content[:MAX_CONTENT])
@@ -987,8 +1096,13 @@ def respond_precompact(
 
 
 def run_self_test() -> None:
-    """Quick verdict parser test: python3 codex-reflector.py --test-parse"""
-    cases = [
+    """Quick self-test: python3 codex-reflector.py --test-parse"""
+    all_passed = 0
+    all_total = 0
+
+    # --- Verdict parser tests ---
+    print("=== Verdict Parser ===")
+    verdict_cases = [
         ("PASS", "PASS"),
         ("FAIL", "FAIL"),
         ("**PASS**", "PASS"),
@@ -1003,18 +1117,86 @@ def run_self_test() -> None:
         ("some random text\nno verdict here", "UNCERTAIN"),
         ("PASS\nFAIL", "UNCERTAIN"),  # contradictory
     ]
-    passed = 0
-    for raw, expected in cases:
+    for raw, expected in verdict_cases:
         result = parse_verdict(raw)
         ok = result == expected
         status = "OK" if ok else "MISMATCH"
         print(
-            f"  {status}: parse_verdict({raw!r:.40}) \u2192 {result} (expected {expected})"
+            f"  {status}: parse_verdict({raw!r:.40}) -> {result} (expected {expected})"
         )
+        all_total += 1
         if ok:
-            passed += 1
-    print(f"\n{passed}/{len(cases)} passed")
-    sys.exit(0 if passed == len(cases) else 1)
+            all_passed += 1
+
+    # --- Plan path extraction tests ---
+    print("\n=== Plan Path Extraction ===")
+    home = str(Path.home())
+    valid_path = f"{home}/.claude/plans/test-slug.md"
+
+    plan_cases: list[tuple[object, str | None, str]] = [
+        # (tool_response, expected_result, description)
+        (
+            {"filePath": valid_path, "plan": "content", "isAgent": False},
+            valid_path,
+            "dict with filePath",
+        ),
+        (
+            {"plan": "content only"},
+            None,
+            "dict without filePath",
+        ),
+        (
+            f"Your plan has been saved to: {valid_path}\nYou can refer back.",
+            valid_path,
+            "string with saved-to pattern",
+        ),
+        (
+            "No plan path in this string",
+            None,
+            "string without pattern",
+        ),
+        (None, None, "None input"),
+        ("", None, "empty string"),
+        ({}, None, "empty dict"),
+        (
+            {"filePath": "/etc/passwd"},
+            None,
+            "path outside ~/.claude/plans/ (confinement)",
+        ),
+        (
+            {"filePath": f"{home}/.claude/plans/../../../etc/passwd"},
+            None,
+            "path traversal attempt (confinement)",
+        ),
+        (
+            {"filePath": f"{home}/.claude/plans/test.txt"},
+            None,
+            "non-.md extension (confinement)",
+        ),
+        (
+            {"content": f"saved to: {valid_path}"},
+            valid_path,
+            "dict with content key containing pattern",
+        ),
+        (
+            f"saved to: {home}/.claude/plans/slug-agent-a35ec22.md",
+            f"{home}/.claude/plans/slug-agent-a35ec22.md",
+            "agent-suffixed plan path",
+        ),
+    ]
+    for tool_response, expected, desc in plan_cases:
+        result = _extract_plan_path(tool_response)
+        ok = result == expected
+        status = "OK" if ok else "MISMATCH"
+        print(
+            f"  {status}: _extract_plan_path ({desc}) -> {result!r:.60} (expected {expected!r:.60})"
+        )
+        all_total += 1
+        if ok:
+            all_passed += 1
+
+    print(f"\n{all_passed}/{all_total} passed")
+    sys.exit(0 if all_passed == all_total else 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1083,7 +1265,7 @@ def main() -> None:
             raw = invoke_codex(prompt, cwd, effort, model)
             result = respond_code_review(session_id, tool_name, tool_input, raw)
         elif category == "plan_review":
-            plan = _find_latest_plan(cwd)
+            plan = _find_plan_for_session(hook_data)
             if plan is None:
                 sys.exit(0)
                 return
