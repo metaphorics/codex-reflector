@@ -37,11 +37,13 @@ FAST_MODEL = "gpt-5.1-codex-mini"
 # Compact output directives — verdict vs non-verdict prompts.
 _COMPACT_VERDICT = """
 
-OUTPUT CONSTRAINTS: ≤150 words. First line is PASS or FAIL only. Then bullet points, one per issue, max 5."""
+OUTPUT CONSTRAINTS: ≤100 words. First line is PASS or FAIL only.
+If FAIL: Each bullet = 1 brief reason + 1 actionable suggestion. Format: "<Category>: <Problem>. Fix: <Action>."
+Max 3 bullets. No verbose explanations."""
 
 _COMPACT_ANALYSIS = """
 
-OUTPUT CONSTRAINTS: ≤150 words. No preamble, no hedging. Bullet points only, max 5."""
+OUTPUT CONSTRAINTS: ≤80 words. No preamble, no hedging. Bullet points only, max 3."""
 
 
 def debug(msg: str) -> None:
@@ -400,7 +402,7 @@ def _validate_plan_path(path_str: str) -> str | None:
     return str(resolved)
 
 
-def _extract_plan_path(tool_response: object) -> str | None:
+def _extract_plan_path(tool_response: dict | str | None) -> str | None:
     """Extract plan file path from ExitPlanMode tool_response.
 
     Handles dict (with filePath key) and string (with "saved to:" text).
@@ -596,7 +598,7 @@ def build_code_review_prompt(tool_name: str, tool_input: dict) -> str:
     sandboxed = _sandbox_content("code-change", snippet)
 
     return (
-        f"""You are an adversarial code reviewer. Assume defects exist until proven otherwise.
+        f"""You are an adversarial code reviewer. Be terse and actionable.
 
 File: {file_path}
 Tool: {tool_name}
@@ -604,18 +606,13 @@ Tool: {tool_name}
 {sandboxed}
 {focus_block}
 
-Find problems in these categories:
-1. CORRECTNESS: Logic errors, race conditions, off-by-one, extreme/empty inputs
-2. SECURITY: Injection, unvalidated inputs, info leaks, privilege escalation
-3. FAILURE MODES: What happens when dependencies fail, resources exhaust, state corrupts?
-4. IMPLICIT ASSUMPTIONS: Undocumented contracts that callers could violate
-5. MISSING ERROR HANDLING: Uncaught exceptions, swallowed errors, silent failures
+Find problems in: correctness, security, failure modes, assumptions, error handling.
 
 Your first line MUST be exactly PASS or FAIL.
-FAIL if: any non-trivial correctness or security issue found.
-PASS only if: no meaningful issues found after thorough review.
+FAIL if: any non-trivial issue found.
+PASS only if: no meaningful issues after review.
 
-Then explain your findings concisely."""
+If FAIL, each bullet must state: <Category>: <Brief problem>. Fix: <Specific action>."""
         + _COMPACT_VERDICT
     )
 
@@ -725,25 +722,19 @@ def build_plan_review_prompt(plan_content: str, plan_path: str) -> str:
     sandboxed = _sandbox_content("plan", _redact(plan_content))
 
     return (
-        f"""You are an adversarial plan reviewer. Assume the plan has critical gaps.
+        f"""You are an adversarial plan reviewer. Be terse and actionable.
 
 Plan file: {plan_path}
 
 {sandboxed}
 
-Evaluate across these dimensions:
-1. COMPLETENESS: Are all requirements addressed? Missing steps, unhandled cases?
-2. FEASIBILITY: Can this plan actually be implemented? Hidden complexity, missing dependencies?
-3. CORRECTNESS: Are the proposed changes technically sound? Will they work as described?
-4. RISK: What can go wrong? Unaddressed failure modes, rollback strategy?
-5. OVERENGINEERING: Is complexity justified? Unnecessary abstractions, premature optimization?
-6. COHERENCE: Do all sections align? Contradictions between sections?
+Evaluate: completeness, feasibility, correctness, risk, overengineering, coherence.
 
 Your first line MUST be exactly PASS or FAIL.
-FAIL if: critical gaps, feasibility issues, or significant technical errors found.
-PASS only if: plan is comprehensive, feasible, and technically sound.
+FAIL if: critical gaps or significant errors found.
+PASS only if: plan is sound and feasible.
 
-Then explain your findings concisely."""
+If FAIL, each bullet must state: <Category>: <Brief problem>. Fix: <Specific action>."""
         + _COMPACT_VERDICT
     )
 
@@ -754,22 +745,17 @@ def build_subagent_review_prompt(agent_type: str, transcript_tail: str) -> str:
     )
 
     return (
-        f"""You are reviewing the output of a {agent_type} subagent.
-Assume the subagent took shortcuts or missed requirements. Find what's wrong.
+        f"""You are reviewing a {agent_type} subagent output. Be terse and actionable.
 
 {sandboxed}
 
-Evaluate critically:
-1. TASK COMPLETION: Did the subagent actually accomplish what was asked?
-2. QUALITY: Is the output accurate, well-structured, and actionable?
-3. MISSED REQUIREMENTS: What did the subagent fail to address?
-4. ERRORS: Are there factual mistakes, incorrect assumptions, or flawed reasoning?
+Evaluate: task completion, quality, missed requirements, errors.
 
 Your first line MUST be exactly PASS or FAIL.
-FAIL if: task incomplete, quality poor, significant requirements missed, or factual errors.
-PASS only if: task fully completed with accurate, high-quality output.
+FAIL if: incomplete, poor quality, or errors found.
+PASS only if: fully completed with high quality.
 
-Then explain your findings concisely."""
+If FAIL, each bullet must state: <Issue>: <Brief problem>. Fix: <Specific action>."""
         + _COMPACT_VERDICT
     )
 
@@ -803,24 +789,18 @@ def build_stop_review_prompt(
         extra_block = "\nContext-specific focus:\n" + "\n".join(f"- {e}" for e in extra)
 
     return (
-        f"""You are a critical session reviewer. The agent is about to stop working.
-Review what was accomplished and determine if the work is truly complete.
+        f"""You are a session reviewer. Be terse and actionable.
 
 {context}
 {extra_block}
 
-Evaluate critically:
-1. COMPLETENESS: Was the original request fully addressed? Unfinished items, TODOs, partial implementations?
-2. SOLIDIFICATION: Does the code need hardening, better error handling, or edge case coverage?
-3. YAGNI/OVERENGINEERING: Was unnecessary complexity introduced? Abstractions nobody asked for?
-4. CONTINUATIONS: Obvious follow-up tasks that should be done before stopping?
-5. FIXES: Broken tests, lint errors, or regressions introduced by the changes?
+Evaluate: completeness, solidification, YAGNI/overengineering, continuations, fixes.
 
 Your first line MUST be exactly PASS or FAIL.
-FAIL if: work incomplete, has regressions, needs critical fixes, or significant quality issues.
-PASS only if: all requested work is complete and codebase is in a clean state.
+FAIL if: incomplete, regressions, or quality issues.
+PASS only if: work complete and codebase clean.
 
-Then provide concise, actionable commentary."""
+If FAIL, each bullet must state: <Category>: <Brief problem>. Fix: <Specific action>."""
         + _COMPACT_VERDICT
     )
 
@@ -1133,7 +1113,7 @@ def run_self_test() -> None:
     home = str(Path.home())
     valid_path = f"{home}/.claude/plans/test-slug.md"
 
-    plan_cases: list[tuple[object, str | None, str]] = [
+    plan_cases: list[tuple[dict | str | None, str | None, str]] = [
         # (tool_response, expected_result, description)
         (
             {"filePath": valid_path, "plan": "content", "isAgent": False},
