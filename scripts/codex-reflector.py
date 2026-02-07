@@ -809,6 +809,14 @@ def format_fails(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# Verdict → display prefix (shared by code review + plan review)
+_VERDICT_PREFIX: dict[str, str] = {
+    "FAIL": "\u26a0\ufe0f FAIL",
+    "PASS": "\u2713 PASS",
+    "UNCERTAIN": "? UNCERTAIN",
+}
+
+
 # ---------------------------------------------------------------------------
 # Response builders
 # ---------------------------------------------------------------------------
@@ -826,13 +834,8 @@ def respond_code_review(
         clear_fail_state(session_id, file_path)
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
-    prefix = {
-        "FAIL": "\u26a0\ufe0f FAIL",
-        "PASS": "\u2713 PASS",
-        "UNCERTAIN": "? UNCERTAIN",
-    }[verdict]
     return {
-        "systemMessage": f"Codex Reflector {prefix} [{file_path}]:\n{raw_output[:MAX_OUTPUT]}"
+        "systemMessage": f"Codex Reflector {_VERDICT_PREFIX[verdict]} [{file_path}]:\n{raw_output[:MAX_OUTPUT]}"
     }
 
 
@@ -862,13 +865,8 @@ def respond_plan_review(session_id: str, plan_path: str, raw_output: str) -> dic
         clear_fail_state(session_id, plan_path)
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
-    prefix = {
-        "FAIL": "\u26a0\ufe0f FAIL",
-        "PASS": "\u2713 PASS",
-        "UNCERTAIN": "? UNCERTAIN",
-    }[verdict]
     return {
-        "systemMessage": f"Codex Plan Review {prefix} [{plan_path}]:\n{raw_output[:MAX_OUTPUT]}"
+        "systemMessage": f"Codex Plan Review {_VERDICT_PREFIX[verdict]} [{plan_path}]:\n{raw_output[:MAX_OUTPUT]}"
     }
 
 
