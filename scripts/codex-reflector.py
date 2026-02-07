@@ -1012,11 +1012,10 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
 
     # 3. Active review: gather context
     transcript_path = hook_data.get("transcript_path", "")
-    transcript_tail = _read_tail(transcript_path)
 
     stat, diff = _get_git_diff(cwd)
 
-    if not transcript_tail and not stat and not diff:
+    if not transcript_path and not stat and not diff:
         debug("no transcript/diff available, approving stop")
         return None  # fail-open
 
@@ -1024,7 +1023,7 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
     git_context = ""
     if stat or diff:
         git_context = f"--- git diff --stat ---\n{stat}\n\n--- git diff ---\n{diff}"
-    prompt = build_stop_review_prompt(transcript_tail, git_context, stat, diff)
+    prompt = build_stop_review_prompt(transcript_path, git_context, stat, diff)
     raw_output = invoke_codex(prompt, cwd, effort, model)
 
     if not raw_output:
