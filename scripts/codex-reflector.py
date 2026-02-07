@@ -606,7 +606,7 @@ Tool: {tool_name}
 {sandboxed}
 {focus_block}
 
-Find problems in: correctness, security, failure modes, assumptions, error handling.
+Find problems in: logic, architecture, design, tidiness, memory sanity, concurrency.
 
 Your first line MUST be exactly PASS or FAIL.
 FAIL if: any non-trivial issue found.
@@ -728,7 +728,7 @@ Plan file: {plan_path}
 
 {sandboxed}
 
-Evaluate: completeness, feasibility, correctness, risk, overengineering, coherence.
+Evaluate: logic soundness, architecture fit, design clarity, tidiness, memory sanity, concurrency safety.
 
 Your first line MUST be exactly PASS or FAIL.
 FAIL if: critical gaps or significant errors found.
@@ -749,7 +749,7 @@ def build_subagent_review_prompt(agent_type: str, transcript_tail: str) -> str:
 
 {sandboxed}
 
-Evaluate: task completion, quality, missed requirements, errors.
+Evaluate: logic correctness, architectural alignment, code tidiness, memory handling, concurrency patterns.
 
 Your first line MUST be exactly PASS or FAIL.
 FAIL if: incomplete, poor quality, or errors found.
@@ -794,7 +794,7 @@ def build_stop_review_prompt(
 {context}
 {extra_block}
 
-Evaluate: completeness, solidification, YAGNI/overengineering, continuations, fixes.
+Evaluate: logic integrity, architecture consistency, design tidiness, memory sanity, concurrency correctness.
 
 Your first line MUST be exactly PASS or FAIL.
 FAIL if: incomplete, regressions, or quality issues.
