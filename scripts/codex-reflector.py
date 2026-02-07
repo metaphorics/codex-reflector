@@ -28,7 +28,7 @@ from pathlib import Path
 
 DEBUG = os.environ.get("CODEX_REFLECTOR_DEBUG", "0") == "1"
 MAX_CONTENT = 40_000  # chars sent to codex per prompt
-MAX_OUTPUT = 2000     # chars returned from codex in responses
+MAX_OUTPUT = 2000  # chars returned from codex in responses
 STATE_DIR = Path("/tmp")
 
 
@@ -84,12 +84,25 @@ def parse_verdict(raw: str) -> str:
 # Tool classification
 # ---------------------------------------------------------------------------
 
+
 def classify(tool_name: str, hook_event: str) -> str:
     if hook_event == "PostToolUseFailure":
         return "bash_failure"
-    if tool_name in ("Write", "Edit", "MultiEdit", "Patch") or any(x in tool_name for x in ("edit_file", "write_file", "create_file", "patch_file", "morph-mcp")):
+    if tool_name in ("Write", "Edit", "MultiEdit", "Patch") or any(
+        x in tool_name
+        for x in ("edit_file", "write_file", "create_file", "patch_file", "morph-mcp")
+    ):
         return "code_change"
-    if any(x in tool_name for x in ("sequentialthinking", "sequential_thinking", "thinking", "actor-critic", "shannon")):
+    if any(
+        x in tool_name
+        for x in (
+            "sequentialthinking",
+            "sequential_thinking",
+            "thinking",
+            "actor-critic",
+            "shannon",
+        )
+    ):
         return "thinking"
     return "code_change"  # conservative default
 
@@ -98,6 +111,7 @@ def classify(tool_name: str, hook_event: str) -> str:
 # Codex invocation
 # ---------------------------------------------------------------------------
 
+
 def invoke_codex(prompt: str, cwd: str) -> str:
     """Call `codex exec` in read-only sandbox. Returns raw output or ''."""
     fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex-ref-")
@@ -105,11 +119,16 @@ def invoke_codex(prompt: str, cwd: str) -> str:
     try:
         model = os.environ.get("CODEX_REFLECTOR_MODEL", "")
         cmd = [
-            "codex", "exec",
-            "--sandbox", "read-only",
+            "codex",
+            "exec",
+            "--sandbox",
+            "read-only",
             "--skip-git-repo-check",
             "--full-auto",
-            "-o", out_path,
+            "-c",
+            "model_reasoning_effort=high",
+            "-o",
+            out_path,
         ]
         if model:
             cmd += ["-m", model]
@@ -117,8 +136,12 @@ def invoke_codex(prompt: str, cwd: str) -> str:
 
         debug(f"invoking: {' '.join(cmd)}")
         subprocess.run(
-            cmd, input=prompt, text=True,
-            capture_output=True, timeout=100, cwd=cwd,
+            cmd,
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=100,
+            cwd=cwd,
         )
         result = Path(out_path).read_text(errors="replace").strip()
         debug(f"codex returned {len(result)} chars")
@@ -137,7 +160,10 @@ def invoke_codex(prompt: str, cwd: str) -> str:
 # Prompt templates
 # ---------------------------------------------------------------------------
 
-def build_code_review_prompt(tool_name: str, tool_input: dict, tool_response: dict | None) -> str:
+
+def build_code_review_prompt(
+    tool_name: str, tool_input: dict, tool_response: dict | None
+) -> str:
     file_path = tool_input.get("file_path", tool_input.get("path", "unknown"))
     content = tool_input.get("content", "")
     old = tool_input.get("old_string", "")
@@ -146,7 +172,7 @@ def build_code_review_prompt(tool_name: str, tool_input: dict, tool_response: di
     if content:
         snippet = content[:MAX_CONTENT]
     elif old or new:
-        snippet = f"--- old ---\n{old[:MAX_CONTENT // 2]}\n--- new ---\n{new[:MAX_CONTENT // 2]}"
+        snippet = f"--- old ---\n{old[: MAX_CONTENT // 2]}\n--- new ---\n{new[: MAX_CONTENT // 2]}"
     else:
         snippet = json.dumps(tool_input, indent=2)[:MAX_CONTENT]
 
@@ -223,6 +249,7 @@ Be concise but comprehensive. This summary will be the only context preserved.""
 # FAIL state management (file-locked)
 # ---------------------------------------------------------------------------
 
+
 def _state_path(session_id: str) -> Path:
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
     return STATE_DIR / f"codex-reflector-fails-{safe}.json"
@@ -253,15 +280,19 @@ def _write_state(session_id: str, entries: list[dict]) -> None:
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def write_fail_state(session_id: str, tool_name: str, file_path: str, feedback: str) -> None:
+def write_fail_state(
+    session_id: str, tool_name: str, file_path: str, feedback: str
+) -> None:
     entries = _read_state(session_id)
     # Replace existing entry for same file, or append
     entries = [e for e in entries if e.get("file_path") != file_path]
-    entries.append({
-        "tool_name": tool_name,
-        "file_path": file_path,
-        "feedback": feedback[:1500],
-    })
+    entries.append(
+        {
+            "tool_name": tool_name,
+            "file_path": file_path,
+            "feedback": feedback[:1500],
+        }
+    )
     _write_state(session_id, entries)
 
 
@@ -283,7 +314,10 @@ def format_fails(entries: list[dict]) -> str:
 # Response builders
 # ---------------------------------------------------------------------------
 
-def respond_code_review(session_id: str, tool_name: str, tool_input: dict, raw_output: str) -> dict:
+
+def respond_code_review(
+    session_id: str, tool_name: str, tool_input: dict, raw_output: str
+) -> dict:
     verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
     file_path = tool_input.get("file_path", tool_input.get("path", "unknown"))
 
@@ -292,8 +326,14 @@ def respond_code_review(session_id: str, tool_name: str, tool_input: dict, raw_o
     else:
         clear_fail_state(session_id, file_path)
 
-    prefix = {"FAIL": "\u26a0\ufe0f FAIL", "PASS": "\u2713 PASS", "UNCERTAIN": "? UNCERTAIN"}[verdict]
-    return {"systemMessage": f"Codex Reflector {prefix} [{file_path}]:\n{raw_output[:MAX_OUTPUT]}"}
+    prefix = {
+        "FAIL": "\u26a0\ufe0f FAIL",
+        "PASS": "\u2713 PASS",
+        "UNCERTAIN": "? UNCERTAIN",
+    }[verdict]
+    return {
+        "systemMessage": f"Codex Reflector {prefix} [{file_path}]:\n{raw_output[:MAX_OUTPUT]}"
+    }
 
 
 def respond_thinking(raw_output: str) -> dict:
@@ -360,6 +400,7 @@ def respond_precompact(hook_data: dict, cwd: str) -> dict | None:
 # Self-test mode
 # ---------------------------------------------------------------------------
 
+
 def run_self_test() -> None:
     """Quick verdict parser test: python3 codex-reflector.py --test-parse"""
     cases = [
@@ -382,7 +423,9 @@ def run_self_test() -> None:
         result = parse_verdict(raw)
         ok = result == expected
         status = "OK" if ok else "MISMATCH"
-        print(f"  {status}: parse_verdict({raw!r:.40}) → {result} (expected {expected})")
+        print(
+            f"  {status}: parse_verdict({raw!r:.40}) → {result} (expected {expected})"
+        )
         if ok:
             passed += 1
     print(f"\n{passed}/{len(cases)} passed")
@@ -392,6 +435,7 @@ def run_self_test() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     if "--test-parse" in sys.argv:
