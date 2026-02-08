@@ -47,7 +47,7 @@ stdin JSON → main() dispatch by event
 7. **Gating** — `_gate_model_effort()` upgrades/downgrades model+effort based on file size and content
 8. **Plan discovery** — `_validate_plan_path()`, `_extract_plan_path()`, `_find_plan_for_session()`, `_find_latest_plan_global()` — confined to `~/.claude/plans/*.md`
 9. **Codex invocation** — `invoke_codex()`: subprocess `codex exec --sandbox read-only`, tempfile output, fail-open
-10. **Prompt builders** — `build_code_review_prompt()`, `build_thinking_prompt()`, `build_bash_failure_prompt()`, `build_plan_review_prompt()`, `build_subagent_review_prompt()`, `build_stop_review_prompt()`, `build_precompact_prompt()`
+10. **Prompt builders** — `build_code_review_prompt()`, `build_thinking_prompt()`, `build_bash_failure_prompt()`, `build_plan_review_prompt()`, `build_subagent_review_prompt()`, `build_stop_review_prompt()`, `build_precompact_prompt()` (metacognition layer — reflections on reasoning quality, bad habits, decision quality, workflow efficiency, and practices to continue)
 11. **State** — `_state_path()`, `_atomic_update_state()` (fcntl.flock), `_read_state()`, `write_fail_state()`, `clear_fail_state()`, `format_fails()`
 12. **Output compaction** — `_compact_output()`: re-summarizes verbose output (>1500 chars) into <=5 bullets via FAST_MODEL
 13. **Response builders** — `respond_code_review()`, `respond_thinking()`, `respond_bash_failure()`, `respond_plan_review()`, `respond_subagent_review()`, `respond_stop()`, `respond_precompact()`

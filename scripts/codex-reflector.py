@@ -768,22 +768,21 @@ If FAIL, each bullet must state: <Category>: <Brief problem>. Fix: <Specific act
 def build_precompact_prompt(transcript_content: str, cwd: str = "") -> str:
     truncated = _smart_truncate(transcript_content, cwd=cwd)
     return (
-        f"""You are summarizing critical session context before compaction.
+        f"""You are a metacognition layer reflecting on agent session quality before compaction.
 The following is the tail of the conversation transcript.
 
 ```
 {truncated}
 ```
 
-Summarize the critical context that MUST survive compaction:
-- Key decisions made and their rationale
-- Unresolved issues or blockers
-- Current task state and progress
-- Important file paths and code locations
-- Constraints or requirements discovered
-- Any pending FAIL reviews or action items
+Analyze the session across these dimensions and surface actionable insights:
+- Reasoning quality: logical gaps, premature conclusions, missed alternatives
+- Bad habits: over-engineering, scope creep, wrong tool choices, unnecessary files
+- Decision quality: trade-off rigor, assumption validation, edge case coverage
+- Workflow efficiency: parallelization, tool effectiveness, unnecessary back-and-forth
+- What worked: patterns and practices to continue following
 
-Be concise but comprehensive. This summary will be the only context preserved."""
+Focus on what the agent should correct or reinforce going forward."""
         + _COMPACT_ANALYSIS
     )
 
@@ -1059,7 +1058,7 @@ def respond_precompact(
         return None
 
     # PreCompact doesn't support hookSpecificOutput -- use systemMessage
-    return {"systemMessage": f"Critical context summary (by Codex):\n{raw_output}"}
+    return {"systemMessage": f"Session metacognition (by Codex):\n{raw_output}"}
 
 
 # ---------------------------------------------------------------------------
