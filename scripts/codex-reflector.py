@@ -23,29 +23,15 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-import tiktoken
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 DEBUG = os.environ.get("CODEX_REFLECTOR_DEBUG", "0") == "1"
-MAX_TRUNCATE_TOKENS = 200_000  # default token budget for smart truncation
-MAX_OUTPUT_TOKENS = 5_000  # token budget for output truncation
+MAX_COMPACT_CHARS = 400_000  # ~100K tokens at ~4 chars/token — trigger compaction above this
 STATE_DIR = Path("/tmp")
 DEFAULT_MODEL = "gpt-5.3-codex"
 FAST_MODEL = "gpt-5.1-codex-mini"
-
-# Lazy-loaded tiktoken encoder (cl100k_base covers GPT-4/Codex family)
-_encoder: tiktoken.Encoding | None = None
-
-
-def _count_tokens(text: str) -> int:
-    """Estimate token count using tiktoken cl100k_base."""
-    global _encoder
-    if _encoder is None:
-        _encoder = tiktoken.get_encoding("cl100k_base")
-    return len(_encoder.encode(text, disallowed_special=()))
 
 
 # Compact output directives — verdict vs non-verdict prompts.
@@ -112,24 +98,14 @@ def _read_tail(path: str, max_bytes: int = 20_000) -> str:
 
 
 def _smart_truncate(
-    text: str, max_tokens: int = MAX_TRUNCATE_TOKENS, cwd: str = ""
+    text: str, max_chars: int = MAX_COMPACT_CHARS, cwd: str = ""
 ) -> str:
-    """HEAD~SUMMARY~TAIL truncation with FAST_MODEL middle summarization.
-
-    Keeps first 40% and last 40% of the token budget, summarizes the middle
-    with FAST_MODEL when cwd is available. Falls back to a marker when
-    summarization is unavailable or fails.
-    """
-    if not text:
-        return text
-    tokens = _count_tokens(text)
-    if tokens <= max_tokens:
+    """HEAD~SUMMARY~TAIL compaction with FAST_MODEL middle summarization."""
+    if not text or len(text) <= max_chars:
         return text
 
-    # Approximate chars-per-token ratio for splitting
-    char_ratio = len(text) / max(tokens, 1)
-    head_chars = int(max_tokens * 0.4 * char_ratio)
-    tail_chars = int(max_tokens * 0.4 * char_ratio)
+    head_chars = int(max_chars * 0.4)
+    tail_chars = int(max_chars * 0.4)
 
     head = text[:head_chars]
     tail = text[-tail_chars:] if tail_chars else ""
@@ -144,10 +120,9 @@ def _smart_truncate(
         )
         summary = invoke_codex(summary_prompt, cwd, effort="medium", model=FAST_MODEL)
         if summary:
-            omitted = tokens - max_tokens
             return (
                 head
-                + f"\n\n[--- SUMMARIZED MIDDLE ({omitted} tokens omitted) ---]\n"
+                + f"\n\n[--- SUMMARIZED MIDDLE ({len(middle)} chars omitted) ---]\n"
                 + summary
                 + "\n[--- END SUMMARY ---]\n\n"
                 + tail
@@ -638,7 +613,7 @@ def build_thinking_prompt(tool_name: str, tool_input: dict) -> str:
         )
 
     sandboxed = _sandbox_content(
-        "reasoning-step", _smart_truncate(_redact(text), max_tokens=25_000)
+        "reasoning-step", _smart_truncate(_redact(text), max_chars=100_000)
     )
 
     return (
@@ -696,7 +671,7 @@ def build_bash_failure_prompt(tool_input: dict, error: str) -> str:
         f"""A bash command failed. Perform structured root cause analysis.
 
 Command: {_redact(command)}
-Error: {_smart_truncate(_redact(error), max_tokens=5_000)}
+Error: {_smart_truncate(_redact(error), max_chars=20_000)}
 {extra_block}
 
 Analyze:
@@ -762,7 +737,7 @@ def build_stop_review_prompt(transcript_content: str, cwd: str = "") -> str:
     sandboxed = _sandbox_content("transcript", truncated)
 
     extra: list[str] = []
-    if _count_tokens(transcript_content) > 10_000:
+    if len(transcript_content) > 40_000:
         extra.append(
             "LONG SESSION: Verify early requirements weren't lost or forgotten during extended work."
         )
@@ -925,7 +900,7 @@ def _compact_output(text: str, cwd: str) -> str:
         "Compress this review into ≤5 bullet points. "
         "First line MUST be the verdict (PASS or FAIL). "
         "Each bullet: <Category>: <Problem>. Fix: <Action>.\n\n"
-        + _smart_truncate(text, max_tokens=3000)
+        + _smart_truncate(text, max_chars=12_000)
     )
     result = invoke_codex(prompt, cwd, effort="medium", model=FAST_MODEL)
     return result if result else text  # fail-open
@@ -949,24 +924,20 @@ def respond_code_review(
         clear_fail_state(session_id, file_path)
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
-    output = _smart_truncate(raw_output, max_tokens=MAX_OUTPUT_TOKENS)
     prefix = _VERDICT_PREFIX[verdict]
-    if verdict == "UNCERTAIN":
-        return {
-            "decision": "block",
-            "reason": f"Codex Reflector {prefix} [{file_path}]:\n{output}",
-        }
-    return {"systemMessage": f"Codex Reflector {prefix} [{file_path}]:\n{output}"}
+    msg = f"Codex Reflector {prefix} [{file_path}]:\n{raw_output}"
+    if verdict in ("FAIL", "UNCERTAIN"):
+        return {"systemMessage": msg, "_exit": 1}
+    return {"systemMessage": msg}
 
 
 def respond_thinking(raw_output: str) -> dict:
     if not raw_output:
         return {}
-    output = _smart_truncate(raw_output, max_tokens=MAX_OUTPUT_TOKENS)
     return {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": f"Codex Metacognition:\n{output}",
+            "additionalContext": f"Codex Metacognition:\n{raw_output}",
         }
     }
 
@@ -974,8 +945,7 @@ def respond_thinking(raw_output: str) -> dict:
 def respond_bash_failure(raw_output: str) -> dict:
     if not raw_output:
         return {}
-    output = _smart_truncate(raw_output, max_tokens=MAX_OUTPUT_TOKENS)
-    return {"systemMessage": f"Codex Diagnostic:\n{output}"}
+    return {"systemMessage": f"Codex Diagnostic:\n{raw_output}"}
 
 
 def respond_plan_review(
@@ -990,34 +960,32 @@ def respond_plan_review(
         clear_fail_state(session_id, plan_path)
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
-    output = _smart_truncate(raw_output, max_tokens=MAX_OUTPUT_TOKENS)
     prefix = _VERDICT_PREFIX[verdict]
-    if verdict == "UNCERTAIN":
-        return {
-            "decision": "block",
-            "reason": f"Codex Plan Review {prefix} [{plan_path}]:\n{output}",
-        }
-    return {"systemMessage": f"Codex Plan Review {prefix} [{plan_path}]:\n{output}"}
+    msg = f"Codex Plan Review {prefix} [{plan_path}]:\n{raw_output}"
+    if verdict in ("FAIL", "UNCERTAIN"):
+        return {"systemMessage": msg, "_exit": 1}
+    return {"systemMessage": msg}
 
 
-def respond_subagent_review(raw_output: str, cwd: str = "") -> dict | None:
+def respond_subagent_review(
+    session_id: str, agent_type: str, raw_output: str, cwd: str = ""
+) -> dict | None:
     if not raw_output:
         return None
     raw_output = _compact_output(raw_output, cwd)
     verdict = parse_verdict(raw_output)
-    output = _smart_truncate(raw_output, max_tokens=MAX_OUTPUT_TOKENS)
+
     if verdict == "FAIL":
-        return {
-            "decision": "block",
-            "reason": f"Codex Subagent Review FAIL:\n{output}",
-        }
-    if verdict == "PASS":
-        return {"systemMessage": f"Codex Subagent Review PASS:\n{output}"}
-    # UNCERTAIN: fail-closed — block
-    return {
-        "decision": "block",
-        "reason": f"Codex Subagent Review UNCERTAIN:\n{output}",
-    }
+        write_fail_state(session_id, "SubagentStop", agent_type, raw_output)
+    elif verdict == "PASS":
+        clear_fail_state(session_id, agent_type)
+    # UNCERTAIN: no state change (preserves prior FAIL if any)
+
+    prefix = _VERDICT_PREFIX[verdict]
+    msg = f"Codex Subagent Review {prefix}:\n{raw_output}"
+    if verdict in ("FAIL", "UNCERTAIN"):
+        return {"systemMessage": msg, "_exit": 1}
+    return {"systemMessage": msg}
 
 
 def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | None:
@@ -1033,7 +1001,7 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
     if fails:
         reason = f"Unresolved Codex FAIL reviews:\n{format_fails(fails)}"
         debug(f"blocking stop: {len(fails)} fails")
-        return {"decision": "block", "reason": reason}
+        return {"decision": "block", "reason": reason, "_exit": 2}
 
     # 3. Read full transcript (no git diff — transcript contains all changes)
     transcript_path = hook_data.get("transcript_path", "")
@@ -1053,19 +1021,20 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
     # 5. Parse verdict + compact output
     raw_output = _compact_output(raw_output, cwd)
     verdict = parse_verdict(raw_output)
-    output = _smart_truncate(raw_output, max_tokens=MAX_OUTPUT_TOKENS)
     if verdict == "FAIL":
         return {
             "decision": "block",
-            "reason": f"Codex Stop Review FAIL:\n{output}",
+            "reason": f"Codex Stop Review FAIL:\n{raw_output}",
+            "_exit": 2,
         }
     if verdict == "PASS":
-        return {"systemMessage": f"Codex Stop Review PASS:\n{output}"}
+        return {"systemMessage": f"Codex Stop Review PASS:\n{raw_output}"}
     # UNCERTAIN: fail-closed — block
     debug("stop review UNCERTAIN, blocking (fail-closed)")
     return {
         "decision": "block",
-        "reason": f"Codex Stop Review UNCERTAIN:\n{output}",
+        "reason": f"Codex Stop Review UNCERTAIN:\n{raw_output}",
+        "_exit": 2,
     }
 
 
@@ -1088,8 +1057,7 @@ def respond_precompact(
         return None
 
     # PreCompact doesn't support hookSpecificOutput -- use systemMessage
-    output = _smart_truncate(raw_output, max_tokens=MAX_OUTPUT_TOKENS)
-    return {"systemMessage": f"Critical context summary (by Codex):\n{output}"}
+    return {"systemMessage": f"Critical context summary (by Codex):\n{raw_output}"}
 
 
 # ---------------------------------------------------------------------------
@@ -1242,7 +1210,7 @@ def main() -> None:
             sys.exit(0)
         prompt = build_subagent_review_prompt(agent_type, transcript_tail, cwd=cwd)
         raw = invoke_codex(prompt, cwd, "high", DEFAULT_MODEL)
-        result = respond_subagent_review(raw, cwd=cwd)
+        result = respond_subagent_review(session_id, agent_type, raw, cwd=cwd)
 
     elif event == "PreCompact":
         result = respond_precompact(hook_data, cwd, "high", DEFAULT_MODEL)
@@ -1288,12 +1256,23 @@ def main() -> None:
         debug(f"unhandled event: {event}")
         sys.exit(0)
 
-    # Output: exit 2 = blocking (FAIL/UNCERTAIN), exit 0 = ok (PASS/no result)
+    # Output: exit 0 = pass, exit 1 = fail/ambiguous, exit 2 = blocking
     if result:
-        if result.get("decision") == "block":
-            print(json.dumps(result), file=sys.stderr)
-            sys.exit(2)
-        print(json.dumps(result))
+        # Determine exit code: explicit _exit, fallback to 2 for decision:block
+        exit_code = result.get(
+            "_exit", 2 if result.get("decision") == "block" else 0
+        )
+        payload = {k: v for k, v in result.items() if k != "_exit"}
+        if exit_code >= 2:
+            # Exit 2: stderr fed to Claude as plain text
+            print(payload.get("reason", payload.get("systemMessage", "")),
+                  file=sys.stderr)
+            sys.exit(exit_code)
+        if exit_code == 1:
+            # Exit 1: non-blocking, stderr for debug logging only
+            print(json.dumps(payload), file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(payload))
     sys.exit(0)
 
 
