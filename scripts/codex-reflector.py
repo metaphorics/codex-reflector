@@ -28,7 +28,9 @@ from typing import Callable
 # ---------------------------------------------------------------------------
 
 DEBUG = os.environ.get("CODEX_REFLECTOR_DEBUG", "0") == "1"
-MAX_COMPACT_CHARS = 400_000  # ~100K tokens at ~4 chars/token — trigger compaction above this
+MAX_COMPACT_CHARS = (
+    400_000  # ~100K tokens at ~4 chars/token — trigger compaction above this
+)
 STATE_DIR = Path("/tmp")
 DEFAULT_MODEL = "gpt-5.3-codex"
 FAST_MODEL = "gpt-5.1-codex-mini"
@@ -1201,16 +1203,16 @@ def main() -> None:
     if event == "Stop":
         result = respond_stop(hook_data, cwd, "medium", DEFAULT_MODEL)
 
-    elif event == "SubagentStop":
-        if hook_data.get("stop_hook_active"):
-            sys.exit(0)
-        agent_type = hook_data.get("agent_type", "unknown")
-        transcript_tail = _read_tail(hook_data.get("agent_transcript_path", ""))
-        if not transcript_tail:
-            sys.exit(0)
-        prompt = build_subagent_review_prompt(agent_type, transcript_tail, cwd=cwd)
-        raw = invoke_codex(prompt, cwd, "high", DEFAULT_MODEL)
-        result = respond_subagent_review(session_id, agent_type, raw, cwd=cwd)
+    # elif event == "SubagentStop":
+    #     if hook_data.get("stop_hook_active"):
+    #         sys.exit(0)
+    #     agent_type = hook_data.get("agent_type", "unknown")
+    #     transcript_tail = _read_tail(hook_data.get("agent_transcript_path", ""))
+    #     if not transcript_tail:
+    #         sys.exit(0)
+    #     prompt = build_subagent_review_prompt(agent_type, transcript_tail, cwd=cwd)
+    #     raw = invoke_codex(prompt, cwd, "high", DEFAULT_MODEL)
+    #     result = respond_subagent_review(session_id, agent_type, raw, cwd=cwd)
 
     elif event == "PreCompact":
         result = respond_precompact(hook_data, cwd, "high", DEFAULT_MODEL)
@@ -1259,14 +1261,13 @@ def main() -> None:
     # Output: exit 0 = pass, exit 1 = fail/ambiguous, exit 2 = blocking
     if result:
         # Determine exit code: explicit _exit, fallback to 2 for decision:block
-        exit_code = result.get(
-            "_exit", 2 if result.get("decision") == "block" else 0
-        )
+        exit_code = result.get("_exit", 2 if result.get("decision") == "block" else 0)
         payload = {k: v for k, v in result.items() if k != "_exit"}
         if exit_code >= 2:
             # Exit 2: stderr fed to Claude as plain text
-            print(payload.get("reason", payload.get("systemMessage", "")),
-                  file=sys.stderr)
+            print(
+                payload.get("reason", payload.get("systemMessage", "")), file=sys.stderr
+            )
             sys.exit(exit_code)
         if exit_code == 1:
             # Exit 1: non-blocking, stderr for debug logging only
