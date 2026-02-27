@@ -45,11 +45,17 @@ FAST_MODEL = "gpt-5.1-codex-mini"  # 400k context window
 
 ModelEffort = namedtuple("ModelEffort", ["model", "effort"])
 
-_ME_CODE_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")             # base: simple changes
-_ME_CODE_REVIEW_HARD = ModelEffort(FAST_MODEL, "high")             # security/test/data file, large, or significant change
-_ME_CODE_REVIEW_COMPLEX = ModelEffort(FAST_MODEL, "xhigh")         # multiple complexity signals
-_ME_CODE_REVIEW_TINY = ModelEffort(LIGHTNING_FAST_MODEL, "xhigh")  # trivial: old+new < 200 chars
-_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "xhigh")
+_ME_CODE_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # base: simple changes
+_ME_CODE_REVIEW_HARD = ModelEffort(
+    FAST_MODEL, "high"
+)  # security/test/data file, large, or significant change
+_ME_CODE_REVIEW_COMPLEX = ModelEffort(
+    FAST_MODEL, "xhigh"
+)  # multiple complexity signals
+_ME_CODE_REVIEW_TINY = ModelEffort(
+    LIGHTNING_FAST_MODEL, "xhigh"
+)  # trivial: old+new < 200 chars
+_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "high")
 _ME_THINKING = ModelEffort(LIGHTNING_FAST_MODEL, "xhigh")
 _ME_BASH_FAILURE = ModelEffort(LIGHTNING_FAST_MODEL, "high")
 _ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")
@@ -151,7 +157,9 @@ def _matryoshka_compact(
         if len(summary) <= max_chars:
             return summary
         current = summary  # nest: summarize the summary
-        debug(f"matryoshka layer {layer + 1}: {len(summary)} chars (target {max_chars})")
+        debug(
+            f"matryoshka layer {layer + 1}: {len(summary)} chars (target {max_chars})"
+        )
 
     return current[:max_chars]  # safety truncation after max layers
 
@@ -594,7 +602,9 @@ def build_code_review_prompt(
         snippet = f"--- old ---\n{_redact(old)}\n--- new ---\n{_redact(new)}"
         snippet = _matryoshka_compact(snippet, cwd=cwd)
     else:
-        snippet = _matryoshka_compact(_redact(json.dumps(tool_input, indent=2)), cwd=cwd)
+        snippet = _matryoshka_compact(
+            _redact(json.dumps(tool_input, indent=2)), cwd=cwd
+        )
 
     # Extract tool_response context (success/error info from the tool)
     response_context = ""
