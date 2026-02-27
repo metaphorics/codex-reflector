@@ -5,7 +5,7 @@ Claude Code plugin that routes hook events to OpenAI Codex CLI for independent s
 ## Commands
 
 ```bash
-# Self-test (verdict parser + plan path extraction, 25 cases)
+# Self-test (verdict parser + plan path extraction + dedup hash, 31 cases)
 python3 scripts/codex-reflector.py --test-parse
 
 # Lint
@@ -19,21 +19,23 @@ No build step. No pip dependencies — stdlib only.
 
 ## Architecture
 
-Single-file plugin: `scripts/codex-reflector.py` (1281 LOC, 985 code).
+Single-file plugin: `scripts/codex-reflector.py` (~1525 LOC, ~1203 code).
 
-`hooks/hooks.json` routes 4 events (`PostToolUse`, `PostToolUseFailure`, `Stop`, `PreCompact`) to the same Python script. All dispatch logic is in Python via `classify()` and event matching in `main()`.
+`hooks/hooks.json` routes 4 events (`PostToolUse`, `PostToolUseFailure` (async), `Stop`, `PreCompact`) to the same Python script. All dispatch logic is in Python via `classify()` and event matching in `main()`.
 
 ### Data flow
 
 ```
 stdin JSON → main() dispatch by event
   → classify() routes tool_name to category (code_change | plan_review | thinking | bash_failure)
+  → _check_dedup() skips Codex if identical content was reviewed recently (code_change only)
   → _gate_model_effort() adjusts model/effort heuristically
-  → build_*_prompt() constructs review prompt
+  → build_*_prompt() constructs review prompt (includes tool_response context)
   → invoke_codex() calls `codex exec --sandbox read-only` (100s timeout, fail-open)
+  → _record_dedup() caches verdict hash for dedup (code_change only)
   → parse_verdict() extracts PASS/FAIL/UNCERTAIN via regex
-  → respond_*() builds output dict with _exit routing key
-  → main() strips _exit, routes to stdout (exit 0) or stderr (exit 1/2)
+  → respond_*() builds output dict with dual-channel output (systemMessage + additionalContext)
+  → main() routes: exit 0 (JSON stdout) or exit 2 (blocking, stderr text)
 ```
 
 ### Source sections (in order)
@@ -49,10 +51,11 @@ stdin JSON → main() dispatch by event
 9. **Codex invocation** — `invoke_codex()`: subprocess `codex exec --sandbox read-only`, tempfile output, fail-open
 10. **Prompt builders** — `build_code_review_prompt()`, `build_thinking_prompt()`, `build_bash_failure_prompt()`, `build_plan_review_prompt()`, `build_subagent_review_prompt()`, `build_stop_review_prompt()`, `build_precompact_prompt()` (metacognition layer — reflections on reasoning quality, bad habits, decision quality, workflow efficiency, and practices to continue)
 11. **State** — `_state_path()`, `_atomic_update_state()` (fcntl.flock), `_read_state()`, `write_fail_state()`, `clear_fail_state()`, `format_fails()`
-12. **Output compaction** — `_compact_output()`: re-summarizes verbose output (>1500 chars) into <=5 bullets via FAST_MODEL
-13. **Response builders** — `respond_code_review()`, `respond_thinking()`, `respond_bash_failure()`, `respond_plan_review()`, `respond_subagent_review()`, `respond_stop()`, `respond_precompact()`
-14. **Self-test** — `run_self_test()`: 13 verdict parser + 12 plan path extraction cases
-15. **Main** — `main()`: arg parsing, kill switch, stdin JSON, event routing, exit code dispatch
+12. **Dedup cache** — `_review_hash()`, `_check_dedup()`, `_record_dedup()`: SHA-256 content hashing with TTL-based session-scoped cache to avoid re-reviewing identical edits
+13. **Output compaction** — `_compact_output()`: re-summarizes verbose output (>1500 chars) into <=5 bullets via FAST_MODEL
+14. **Response builders** — `respond_code_review()`, `respond_thinking()`, `respond_bash_failure()`, `respond_plan_review()`, `respond_subagent_review()`, `respond_stop()`, `respond_precompact()`
+15. **Self-test** — `run_self_test()`: 13 verdict parser + 12 plan path extraction + 6 dedup hash cases
+16. **Main** — `main()`: arg parsing, kill switch, stdin JSON, event routing, dedup, exit code dispatch
 
 ## Key patterns
 
@@ -60,23 +63,36 @@ stdin JSON → main() dispatch by event
 
 | Exit | Meaning | Output channel |
 |:-----|:--------|:---------------|
-| 0 | Success — JSON processed by Claude Code | stdout (JSON) |
-| 1 | Non-blocking fail — silent to user, debug only | stderr (JSON) |
+| 0 | Success — JSON processed by Claude Code | stdout (JSON with `systemMessage` + `hookSpecificOutput`) |
 | 2 | Blocking — stderr text fed to Claude as context | stderr (plain text) |
+| Other | Non-blocking error — continues silently | stderr (debug only) |
 
 ### `_exit` routing key
 
-Response dicts use `_exit` to control exit code. `main()` strips it before output. If a dict has `decision: "block"` without `_exit`, it defaults to exit 2.
+Response dicts may use `_exit: 2` for blocking decisions (Stop FAIL/UNCERTAIN). `main()` strips `_exit` before output. If a dict has `decision: "block"` without `_exit`, it defaults to exit 2.
+
+### Dual-channel output
+
+All review responses use both output channels:
+- `systemMessage`: shown to the user as a notification
+- `hookSpecificOutput.additionalContext`: injected into Claude's context so it can self-correct
+
+FAIL/UNCERTAIN verdicts exit 0 with JSON (not exit 1), ensuring feedback reaches both user and agent.
 
 ### Deferred feedback strategy
 
-Individual review FAIL/UNCERTAIN results exit with code 1 (non-blocking, silent). FAILs are recorded to `/tmp/codex-reflector-fails-{session_id}.json` with `fcntl.flock` for safe concurrent access. At `Stop`, accumulated FAILs block with exit 2, surfacing all unresolved issues.
+Individual review FAIL/UNCERTAIN results are delivered as non-blocking feedback (exit 0 with `systemMessage` + `additionalContext`). FAILs are additionally recorded to `/tmp/codex-reflector-fails-{session_id}.json` with `fcntl.flock` for safe concurrent access. At `Stop`, accumulated FAILs block with exit 2, surfacing all unresolved issues.
+
+### Content-hash dedup
+
+Before invoking Codex for code reviews, a SHA-256 hash of `(tool_name, file_path, content, old_string, new_string)` is checked against a session-scoped cache (`/tmp/codex-reflector-dedup-{session_id}.json`). Cache hits mirror fail-state bookkeeping (`write_fail_state`/`clear_fail_state`) so Stop sees correct state. PASS hits clear stale FAILs then skip silently; FAIL/UNCERTAIN hits re-surface a short cached message. TTL: 300s. Max entries: 100. Fail-open on all cache errors.
 
 ### Stop hook behavior
 
 - **Loop prevention**: if `stop_hook_active` is true, immediately returns None (exit 0)
 - **Pending FAILs**: fast path — blocks without invoking Codex
-- **Transcript review**: reads tail of transcript, invokes Codex for holistic review
+- **Context**: uses `last_assistant_message` when available, falls back to transcript tail
+- **Transcript review**: invokes Codex for holistic review
 - **Fail-closed for UNCERTAIN**: unlike individual reviews, Stop blocks on UNCERTAIN verdicts
 
 ### Security
@@ -114,20 +130,20 @@ Individual review FAIL/UNCERTAIN results exit with code 1 (non-blocking, silent)
 | Events | Pattern | Key fields |
 |:-------|:--------|:-----------|
 | PostToolUse, Stop | Top-level `decision` | `decision: "block"`, `reason` |
-| PostToolUse | `hookSpecificOutput` | `additionalContext` (thinking tools) |
+| PostToolUse, PostToolUseFailure | `hookSpecificOutput` | `hookEventName`, `additionalContext` |
 
 ### Event input fields
 
 | Event | Fields consumed |
 |:------|:----------------|
 | PostToolUse | `tool_name`, `tool_input`, `tool_response`, `tool_use_id` |
-| PostToolUseFailure | `tool_name`, `tool_input`, `error` |
-| Stop | `stop_hook_active`, `transcript_path` |
+| PostToolUseFailure | `tool_name`, `tool_input`, `tool_response`, `error` |
+| Stop | `stop_hook_active`, `transcript_path`, `last_assistant_message` |
 | PreCompact | `transcript_path` |
 | All events | `session_id`, `cwd`, `hook_event_name` |
 
 ### JSON output fields (used by this plugin)
 
 - `decision: "block"` + `reason` — blocks Claude, continues with reason (Stop event)
-- `systemMessage` — warning shown to user (PostToolUse, Stop, PreCompact)
-- `hookSpecificOutput.additionalContext` — injected into Claude context (thinking tools)
+- `systemMessage` — warning shown to user (all events)
+- `hookSpecificOutput.additionalContext` — injected into Claude context (PostToolUse, PostToolUseFailure, Stop)

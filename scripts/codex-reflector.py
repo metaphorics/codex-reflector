@@ -14,12 +14,14 @@ Env vars:
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -538,7 +540,12 @@ def invoke_codex(prompt: str, cwd: str, effort: str = "medium", model: str = "")
 # ---------------------------------------------------------------------------
 
 
-def build_code_review_prompt(tool_name: str, tool_input: dict, cwd: str = "") -> str:
+def build_code_review_prompt(
+    tool_name: str,
+    tool_input: dict,
+    cwd: str = "",
+    tool_response: dict | str | None = None,
+) -> str:
     file_path = tool_input.get("file_path", tool_input.get("path", "unknown"))
     content = tool_input.get("content", "")
     old = tool_input.get("old_string", "")
@@ -552,6 +559,21 @@ def build_code_review_prompt(tool_name: str, tool_input: dict, cwd: str = "") ->
         snippet = _smart_truncate(snippet, cwd=cwd)
     else:
         snippet = _smart_truncate(_redact(json.dumps(tool_input, indent=2)), cwd=cwd)
+
+    # Extract tool_response context (success/error info from the tool)
+    response_context = ""
+    if isinstance(tool_response, dict):
+        resp_error = tool_response.get("error", "")
+        if resp_error:
+            response_context = (
+                f"\nTool reported error: {_redact(str(resp_error)[:500])}"
+            )
+        resp_file = tool_response.get("filePath", "")
+        if resp_file and resp_file != file_path:
+            response_context += f"\nActual file path: {resp_file}"
+    elif isinstance(tool_response, str) and tool_response.strip():
+        tr = tool_response.strip()[:500]
+        response_context = f"\nTool response: {_redact(tr)}"
 
     # Dynamic heuristic sections
     extra_focus = _file_heuristics(file_path) + _change_size_heuristics(
@@ -569,7 +591,7 @@ def build_code_review_prompt(tool_name: str, tool_input: dict, cwd: str = "") ->
         f"""You are an adversarial code reviewer. Be terse and actionable.
 
 File: {file_path}
-Tool: {tool_name}
+Tool: {tool_name}{response_context}
 
 {sandboxed}
 {focus_block}
@@ -639,8 +661,24 @@ Be direct and concise. Do NOT output PASS or FAIL."""
     )
 
 
-def build_bash_failure_prompt(tool_input: dict, error: str) -> str:
+def build_bash_failure_prompt(
+    tool_input: dict,
+    error: str,
+    tool_response: dict | str | None = None,
+) -> str:
     command = tool_input.get("command", "unknown")
+
+    # Extract additional context from tool_response
+    response_info = ""
+    if isinstance(tool_response, dict):
+        stdout = tool_response.get("stdout", "")
+        stderr_resp = tool_response.get("stderr", "")
+        if stdout:
+            response_info += f"\nStdout (excerpt): {_redact(stdout[:2000])}"
+        if stderr_resp:
+            response_info += f"\nStderr (excerpt): {_redact(stderr_resp[:2000])}"
+    elif isinstance(tool_response, str) and tool_response.strip():
+        response_info = f"\nTool output: {_redact(tool_response.strip()[:2000])}"
 
     # Command-type heuristics
     extra: list[str] = []
@@ -673,7 +711,7 @@ def build_bash_failure_prompt(tool_input: dict, error: str) -> str:
         f"""A bash command failed. Perform structured root cause analysis.
 
 Command: {_redact(command)}
-Error: {_smart_truncate(_redact(error), max_chars=20_000)}
+Error: {_smart_truncate(_redact(error), max_chars=20_000)}{response_info}
 {extra_block}
 
 Analyze:
@@ -887,6 +925,95 @@ _VERDICT_PREFIX: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Content-hash dedup cache (avoids re-reviewing identical edits)
+# ---------------------------------------------------------------------------
+
+_DEDUP_TTL = 300  # seconds — re-review after this
+_DEDUP_MAX = 100  # max cache entries per session
+
+
+def _dedup_path(session_id: str) -> Path:
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
+    return STATE_DIR / f"codex-reflector-dedup-{safe}.json"
+
+
+def _review_hash(tool_name: str, tool_input: dict) -> str:
+    """Compute content hash for dedup. Stable across invocations."""
+    file_path = tool_input.get("file_path", tool_input.get("path", ""))
+    content = tool_input.get("content", "")
+    old = tool_input.get("old_string", "")
+    new = tool_input.get("new_string", "")
+    key = f"{tool_name}|{file_path}|{content}|{old}|{new}"
+    return hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _check_dedup(session_id: str, content_hash: str) -> str | None:
+    """Return cached verdict if hash was reviewed recently, else None."""
+    if not session_id:
+        return None
+    path = _dedup_path(session_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                data = json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        entry = data.get("hashes", {}).get(content_hash)
+        if entry and (time.time() - entry.get("ts", 0)) < _DEDUP_TTL:
+            return entry.get("verdict")
+    except (json.JSONDecodeError, OSError, KeyError):
+        pass
+    return None
+
+
+def _record_dedup(
+    session_id: str, content_hash: str, verdict: str, file_path: str
+) -> None:
+    """Record a review hash+verdict in the dedup cache."""
+    if not session_id:
+        return
+    path = _dedup_path(session_id)
+    if not path.exists():
+        path.touch(mode=0o600)
+    try:
+        with open(path, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                try:
+                    data = json.load(f)
+                except (json.JSONDecodeError, ValueError):
+                    data = {"hashes": {}}
+                hashes = data.get("hashes", {})
+                # Evict expired + enforce max
+                now = time.time()
+                hashes = {
+                    k: v
+                    for k, v in hashes.items()
+                    if now - v.get("ts", 0) < _DEDUP_TTL
+                }
+                if len(hashes) >= _DEDUP_MAX:
+                    oldest_key = min(hashes, key=lambda k: hashes[k].get("ts", 0))
+                    del hashes[oldest_key]
+                hashes[content_hash] = {
+                    "verdict": verdict,
+                    "ts": now,
+                    "file": file_path,
+                }
+                data["hashes"] = hashes
+                f.seek(0)
+                f.truncate()
+                json.dump(data, f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except OSError:
+        pass  # fail-open
+
+
+# ---------------------------------------------------------------------------
 # Output compaction
 # ---------------------------------------------------------------------------
 
@@ -913,7 +1040,12 @@ def _compact_output(text: str, cwd: str) -> str:
 
 
 def respond_code_review(
-    session_id: str, tool_name: str, tool_input: dict, raw_output: str, cwd: str = ""
+    session_id: str,
+    tool_name: str,
+    tool_input: dict,
+    raw_output: str,
+    cwd: str = "",
+    event_name: str = "PostToolUse",
 ) -> dict:
     raw_output = _compact_output(raw_output, cwd) if raw_output else raw_output
     verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
@@ -927,30 +1059,48 @@ def respond_code_review(
 
     prefix = _VERDICT_PREFIX[verdict]
     msg = f"Codex Reflector {prefix} [{file_path}]:\n{raw_output}"
+    result: dict = {"systemMessage": msg}
+    # Inject into Claude context for FAIL/UNCERTAIN so agent can self-correct
     if verdict in ("FAIL", "UNCERTAIN"):
-        return {"systemMessage": msg, "_exit": 1}
-    return {"systemMessage": msg}
+        result["hookSpecificOutput"] = {
+            "hookEventName": event_name,
+            "additionalContext": f"Codex Review {prefix} [{file_path}]:\n{raw_output}",
+        }
+    return result
 
 
-def respond_thinking(raw_output: str) -> dict:
+def respond_thinking(raw_output: str, event_name: str = "PostToolUse") -> dict:
     if not raw_output:
         return {}
     return {
         "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
+            "hookEventName": event_name,
             "additionalContext": f"Codex Metacognition:\n{raw_output}",
         }
     }
 
 
-def respond_bash_failure(raw_output: str) -> dict:
+def respond_bash_failure(
+    raw_output: str, event_name: str = "PostToolUseFailure"
+) -> dict:
     if not raw_output:
         return {}
-    return {"systemMessage": f"Codex Diagnostic:\n{raw_output}"}
+    msg = f"Codex Diagnostic:\n{raw_output}"
+    return {
+        "systemMessage": msg,
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": msg,
+        },
+    }
 
 
 def respond_plan_review(
-    session_id: str, plan_path: str, raw_output: str, cwd: str = ""
+    session_id: str,
+    plan_path: str,
+    raw_output: str,
+    cwd: str = "",
+    event_name: str = "PostToolUse",
 ) -> dict:
     raw_output = _compact_output(raw_output, cwd) if raw_output else raw_output
     verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
@@ -963,13 +1113,21 @@ def respond_plan_review(
 
     prefix = _VERDICT_PREFIX[verdict]
     msg = f"Codex Plan Review {prefix} [{plan_path}]:\n{raw_output}"
+    result: dict = {"systemMessage": msg}
     if verdict in ("FAIL", "UNCERTAIN"):
-        return {"systemMessage": msg, "_exit": 1}
-    return {"systemMessage": msg}
+        result["hookSpecificOutput"] = {
+            "hookEventName": event_name,
+            "additionalContext": f"Codex Plan Review {prefix} [{plan_path}]:\n{raw_output}",
+        }
+    return result
 
 
 def respond_subagent_review(
-    session_id: str, agent_type: str, raw_output: str, cwd: str = ""
+    session_id: str,
+    agent_type: str,
+    raw_output: str,
+    cwd: str = "",
+    event_name: str = "SubagentStop",
 ) -> dict | None:
     if not raw_output:
         return None
@@ -984,9 +1142,13 @@ def respond_subagent_review(
 
     prefix = _VERDICT_PREFIX[verdict]
     msg = f"Codex Subagent Review {prefix}:\n{raw_output}"
+    result: dict = {"systemMessage": msg}
     if verdict in ("FAIL", "UNCERTAIN"):
-        return {"systemMessage": msg, "_exit": 1}
-    return {"systemMessage": msg}
+        result["hookSpecificOutput"] = {
+            "hookEventName": event_name,
+            "additionalContext": f"Codex Subagent Review {prefix}:\n{raw_output}",
+        }
+    return result
 
 
 def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | None:
@@ -1004,9 +1166,14 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
         debug(f"blocking stop: {len(fails)} fails")
         return {"decision": "block", "reason": reason, "_exit": 2}
 
-    # 3. Read full transcript (no git diff — transcript contains all changes)
-    transcript_path = hook_data.get("transcript_path", "")
-    transcript = _read_tail(transcript_path, max_bytes=500_000)
+    # 3. Prefer last_assistant_message; fall back to transcript tail
+    last_msg = hook_data.get("last_assistant_message", "")
+    if last_msg:
+        transcript = last_msg
+        debug(f"using last_assistant_message ({len(last_msg)} chars)")
+    else:
+        transcript_path = hook_data.get("transcript_path", "")
+        transcript = _read_tail(transcript_path, max_bytes=500_000)
     if not transcript:
         debug("no transcript available, approving stop")
         return None  # fail-open
@@ -1029,7 +1196,13 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
             "_exit": 2,
         }
     if verdict == "PASS":
-        return {"systemMessage": f"Codex Stop Review PASS:\n{raw_output}"}
+        return {
+            "systemMessage": f"Codex Stop Review PASS:\n{raw_output}",
+            "hookSpecificOutput": {
+                "hookEventName": "Stop",
+                "additionalContext": f"Codex Stop Review PASS:\n{raw_output}",
+            },
+        }
     # UNCERTAIN: fail-closed — block
     debug("stop review UNCERTAIN, blocking (fail-closed)")
     return {
@@ -1166,6 +1339,49 @@ def run_self_test() -> None:
         if ok:
             all_passed += 1
 
+    # --- Review hash dedup tests ---
+    print("\n=== Review Hash Dedup ===")
+    base_input = {"file_path": "a.py", "old_string": "x", "new_string": "y"}
+    hash_cases = [
+        # (tool_name, tool_input, should_equal_base, description)
+        ("Edit", base_input, True, "identical input"),
+        (
+            "Edit",
+            {"file_path": "a.py", "old_string": "x", "new_string": "y"},
+            True,
+            "same values different dict",
+        ),
+        (
+            "Edit",
+            {"file_path": "b.py", "old_string": "x", "new_string": "y"},
+            False,
+            "different file_path",
+        ),
+        (
+            "Write",
+            {"file_path": "a.py", "content": "z"},
+            False,
+            "different tool + content",
+        ),
+        (
+            "Edit",
+            {"file_path": "a.py", "old_string": "x", "new_string": "z"},
+            False,
+            "different new_string",
+        ),
+        ("Edit", {"path": "c.py", "old_string": "x", "new_string": "y"}, False, "path vs file_path key"),
+    ]
+    base_hash = _review_hash("Edit", base_input)
+    for tool_name, tool_input, should_eq, desc in hash_cases:
+        h = _review_hash(tool_name, tool_input)
+        matches = h == base_hash
+        ok = matches == should_eq
+        status = "OK" if ok else "MISMATCH"
+        print(f"  {status}: _review_hash ({desc}) eq_base={matches} (expected {should_eq})")
+        all_total += 1
+        if ok:
+            all_passed += 1
+
     print(f"\n{all_passed}/{all_total} passed")
     sys.exit(0 if all_passed == all_total else 1)
 
@@ -1230,12 +1446,47 @@ def main() -> None:
 
         error = hook_data.get("error", "")
 
+        tool_response = hook_data.get("tool_response", {})
+
         if category == "code_change":
-            prompt = build_code_review_prompt(tool_name, tool_input, cwd=cwd)
-            raw = invoke_codex(prompt, cwd, effort, model)
-            result = respond_code_review(
-                session_id, tool_name, tool_input, raw, cwd=cwd
-            )
+            # Dedup: skip Codex if identical content was reviewed recently
+            content_hash = _review_hash(tool_name, tool_input)
+            cached_verdict = _check_dedup(session_id, content_hash)
+            if cached_verdict:
+                file_path = tool_input.get(
+                    "file_path", tool_input.get("path", "unknown")
+                )
+                debug(f"dedup hit: {content_hash} → {cached_verdict} [{file_path}]")
+                # Mirror fail-state bookkeeping so Stop sees correct state
+                if cached_verdict == "FAIL":
+                    write_fail_state(
+                        session_id, tool_name, file_path, "(cached FAIL)"
+                    )
+                elif cached_verdict == "PASS":
+                    clear_fail_state(session_id, file_path)
+                    sys.exit(0)  # already reviewed and passed — skip silently
+                # FAIL/UNCERTAIN: re-surface cached verdict without re-invoking Codex
+                prefix = _VERDICT_PREFIX[cached_verdict]
+                result = {
+                    "systemMessage": (
+                        f"Codex Reflector {prefix} [{file_path}]:"
+                        " (cached — same content reviewed recently)"
+                    ),
+                }
+            else:
+                prompt = build_code_review_prompt(
+                    tool_name, tool_input, cwd=cwd, tool_response=tool_response
+                )
+                raw = invoke_codex(prompt, cwd, effort, model)
+                result = respond_code_review(
+                    session_id, tool_name, tool_input, raw, cwd=cwd, event_name=event
+                )
+                # Record for future dedup
+                verdict = parse_verdict(raw) if raw else "UNCERTAIN"
+                file_path = tool_input.get(
+                    "file_path", tool_input.get("path", "unknown")
+                )
+                _record_dedup(session_id, content_hash, verdict, file_path)
         elif category == "plan_review":
             plan = _find_plan_for_session(hook_data)
             if plan is None:
@@ -1243,35 +1494,35 @@ def main() -> None:
             plan_path, plan_content = plan
             prompt = build_plan_review_prompt(plan_content, plan_path, cwd=cwd)
             raw = invoke_codex(prompt, cwd, effort, model)
-            result = respond_plan_review(session_id, plan_path, raw, cwd=cwd)
+            result = respond_plan_review(
+                session_id, plan_path, raw, cwd=cwd, event_name=event
+            )
         elif category == "thinking":
             prompt = build_thinking_prompt(tool_name, tool_input)
             raw = invoke_codex(prompt, cwd, effort, model)
-            result = respond_thinking(raw)
+            result = respond_thinking(raw, event_name=event)
         elif category == "bash_failure":
-            prompt = build_bash_failure_prompt(tool_input, error)
+            prompt = build_bash_failure_prompt(
+                tool_input, error, tool_response=tool_response
+            )
             raw = invoke_codex(prompt, cwd, effort, model)
-            result = respond_bash_failure(raw)
+            result = respond_bash_failure(raw, event_name=event)
 
     else:
         debug(f"unhandled event: {event}")
         sys.exit(0)
 
-    # Output: exit 0 = pass, exit 1 = fail/ambiguous, exit 2 = blocking
+    # Output: exit 0 = JSON to stdout, exit 2 = blocking (stderr fed to Claude)
     if result:
-        # Determine exit code: explicit _exit, fallback to 2 for decision:block
         exit_code = result.get("_exit", 2 if result.get("decision") == "block" else 0)
         payload = {k: v for k, v in result.items() if k != "_exit"}
         if exit_code >= 2:
-            # Exit 2: stderr fed to Claude as plain text
+            # Exit 2: stderr text fed to Claude as context
             print(
                 payload.get("reason", payload.get("systemMessage", "")), file=sys.stderr
             )
             sys.exit(exit_code)
-        if exit_code == 1:
-            # Exit 1: non-blocking, stderr for debug logging only
-            print(json.dumps(payload), file=sys.stderr)
-            sys.exit(1)
+        # Exit 0: JSON to stdout — systemMessage + hookSpecificOutput processed
         print(json.dumps(payload))
     sys.exit(0)
 
