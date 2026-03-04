@@ -45,23 +45,21 @@ FAST_MODEL = "gpt-5.1-codex-mini"  # 400k context window
 
 ModelEffort = namedtuple("ModelEffort", ["model", "effort"])
 
-_ME_CODE_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # base: simple changes
+_ME_CODE_REVIEW = ModelEffort(DEFAULT_MODEL, "low")  # base: simple changes
 _ME_CODE_REVIEW_HARD = ModelEffort(
-    FAST_MODEL, "high"
+    DEFAULT_MODEL, "medium"
 )  # security/test/data file, large, or significant change
 _ME_CODE_REVIEW_COMPLEX = ModelEffort(
-    FAST_MODEL, "xhigh"
+    DEFAULT_MODEL, "high"
 )  # multiple complexity signals
-_ME_CODE_REVIEW_TINY = ModelEffort(
-    LIGHTNING_FAST_MODEL, "xhigh"
-)  # trivial: old+new < 200 chars
-_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "high")
-_ME_THINKING = ModelEffort(LIGHTNING_FAST_MODEL, "xhigh")
-_ME_BASH_FAILURE = ModelEffort(LIGHTNING_FAST_MODEL, "high")
+_ME_CODE_REVIEW_TINY = ModelEffort(DEFAULT_MODEL, "low")  # trivial: old+new < 200 chars
+_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "xhigh")
+_ME_THINKING = ModelEffort(DEFAULT_MODEL, "high")
+_ME_BASH_FAILURE = ModelEffort(FAST_MODEL, "high")
 _ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")
 _ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "high")
 _ME_SUMMARIZE = ModelEffort(FAST_MODEL, "high")  # _compact_output + _matryoshka_compact
-_ME_SUBAGENT_REVIEW = ModelEffort(DEFAULT_MODEL, "high")  # commented-out SubagentStop
+_ME_SUBAGENT_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # commented-out SubagentStop
 
 # Compact output directives — verdict vs non-verdict prompts.
 _COMPACT_VERDICT = """
