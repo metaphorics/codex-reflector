@@ -35,7 +35,9 @@ MAX_COMPACT_CHARS = (
     400_000  # ~100K tokens at ~4 chars/token — trigger compaction above this
 )
 STATE_DIR = Path("/tmp")
-_SYNTHETIC_PREFIX = "synthetic::"  # Readability convention for non-filesystem path identifiers
+_SYNTHETIC_PREFIX = (
+    "synthetic::"  # Readability convention for non-filesystem path identifiers
+)
 DEFAULT_MODEL = "gpt-5.4"  # 1M context window
 LIGHTNING_FAST_MODEL = "gpt-5.3-codex-spark"  # 128k context window
 FAST_MODEL = "gpt-5.1-codex-mini"  # 400k context window
@@ -54,7 +56,7 @@ _ME_CODE_REVIEW_COMPLEX = ModelEffort(
     DEFAULT_MODEL, "xhigh"
 )  # multiple complexity signals
 _ME_CODE_REVIEW_TINY = ModelEffort(DEFAULT_MODEL, "low")  # trivial: old+new < 200 chars
-_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "high")
+_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "xhigh")
 _ME_THINKING = ModelEffort(DEFAULT_MODEL, "medium")
 _ME_BASH_FAILURE = ModelEffort(FAST_MODEL, "high")
 _ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")
