@@ -46,11 +46,11 @@ FAST_MODEL = "gpt-5.4-mini"  # 1M context window
 
 ModelEffort = namedtuple("ModelEffort", ["model", "effort"])
 
-_ME_CODE_REVIEW = ModelEffort(FAST_MODEL, "medium")  # base: simple changes → mini
-_ME_CODE_REVIEW_HARD = ModelEffort(FAST_MODEL, "high")  # risk signals → full model
+_ME_CODE_REVIEW = ModelEffort(FAST_MODEL, "high")  # base: simple changes → mini
+_ME_CODE_REVIEW_HARD = ModelEffort(FAST_MODEL, "xhigh")  # risk signals → full model
 _ME_CODE_REVIEW_COMPLEX = ModelEffort(DEFAULT_MODEL, "medium")
-_ME_CODE_REVIEW_TINY = ModelEffort(FAST_MODEL, "low")  # trivial → mini+low
-_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "high")  # always full
+_ME_CODE_REVIEW_TINY = ModelEffort(FAST_MODEL, "medium")  # trivial → mini+low
+_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")
 _ME_THINKING = ModelEffort(FAST_MODEL, "xhigh")  # thinking → mini
 _ME_BASH_FAILURE = ModelEffort(FAST_MODEL, "low")
 _ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # always full (safety)
