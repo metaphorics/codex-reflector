@@ -46,17 +46,17 @@ FAST_MODEL = "gpt-5.4-mini"  # 1M context window
 
 ModelEffort = namedtuple("ModelEffort", ["model", "effort"])
 
-_ME_CODE_REVIEW = ModelEffort(FAST_MODEL, "high")  # base: simple changes → mini
-_ME_CODE_REVIEW_HARD = ModelEffort(FAST_MODEL, "xhigh")  # risk signals → full model
-_ME_CODE_REVIEW_COMPLEX = ModelEffort(DEFAULT_MODEL, "medium")
-_ME_CODE_REVIEW_TINY = ModelEffort(FAST_MODEL, "medium")  # trivial → mini+low
-_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "xhigh")
-_ME_THINKING = ModelEffort(FAST_MODEL, "xhigh")  # thinking → mini
-_ME_BASH_FAILURE = ModelEffort(FAST_MODEL, "low")
-_ME_STOP_REVIEW = ModelEffort(FAST_MODEL, "xhigh")  # always full (safety)
-_ME_PRECOMPACT = ModelEffort(FAST_MODEL, "high")  # compaction → mini
-_ME_SUMMARIZE = ModelEffort(FAST_MODEL, "medium")
-_ME_SUBAGENT_REVIEW = ModelEffort(FAST_MODEL, "medium")
+_ME_CODE_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # base: generic changes
+_ME_CODE_REVIEW_HARD = ModelEffort(DEFAULT_MODEL, "high")  # risk signals
+_ME_CODE_REVIEW_COMPLEX = ModelEffort(DEFAULT_MODEL, "xhigh")
+_ME_CODE_REVIEW_TINY = ModelEffort(DEFAULT_MODEL, "low")  # trivial → low
+_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "high")
+_ME_THINKING = ModelEffort(DEFAULT_MODEL, "high")
+_ME_BASH_FAILURE = ModelEffort(DEFAULT_MODEL, "low")
+_ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # always full (safety)
+_ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "medium")  # compaction
+_ME_SUMMARIZE = ModelEffort(FAST_MODEL, "high")
+_ME_SUBAGENT_REVIEW = ModelEffort(FAST_MODEL, "high")
 
 # Compact output directives — verdict vs non-verdict prompts.
 _COMPACT_VERDICT = """
